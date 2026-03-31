@@ -77,6 +77,8 @@ If one file does not need changes, still write a proposal file that explains why
 def build_bridge_reference(agent_kind: str) -> str:
     if agent_kind == "codex":
         return "Read `.lex/adapters/codex/AGENTS.md` before starting work.\n"
+    if agent_kind == "gemini":
+        return "Read `.lex/adapters/gemini/GEMINI.md` before starting work.\n"
     return "Read `.lex/adapters/claude/CLAUDE.md` before starting work.\n"
 
 
@@ -92,6 +94,7 @@ def create_merge_packet(root: Path, *, agent_kind: str) -> MergePaths:
     write_text(paths.context_dir / "CLAUDE.original.md", read_text(claude_root))
     write_text(paths.context_dir / "lex-codex-bridge.md", build_bridge_reference("codex"))
     write_text(paths.context_dir / "lex-claude-bridge.md", build_bridge_reference("claude"))
+    write_text(paths.context_dir / "lex-gemini-bridge.md", build_bridge_reference("gemini"))
 
     if not (paths.proposal_dir / "AGENTS.md").exists():
         write_text(

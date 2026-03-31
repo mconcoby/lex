@@ -9,6 +9,7 @@ The v1 implementation in this repository provides:
 - A durable `.lex/` scaffold for project memory
 - A SQLite-backed coordination store for agents, tasks, leases, and messages
 - A Python CLI for bootstrapping, live agent presence, and concurrent task coordination
+- An experimental dispatch control plane for supervised local worker runtimes and task packets
 
 ## Quick start
 
@@ -34,6 +35,12 @@ Current TUI hotkeys:
 - `r` refresh
 - `q` quit
 
+Session bootstrap is mandatory before supervised work. Each new session gets a role-specific bootstrap packet with:
+- role contract and allowed or blocked verbs
+- required first actions
+- workflow template
+- hydrated memory for active tasks, subscriptions, inbox state, and recent decisions
+
 The first step for a new agent instance should be identification. Lex can allocate a unique instance name so two Codex terminals do not accidentally reuse the same identity:
 
 ```bash
@@ -42,7 +49,7 @@ python3 -m lex.cli agent identify codex
 
 That registers a unique name like `codex-brisk-otter`. If you want to choose a name yourself, pass `--name`, and Lex will reject duplicates.
 Agents now use a two-part org model:
-- canonical primary role: `dev`, `pm`, or `auditor`
+- canonical primary role: `dev`, `pm`, `auditor`, or `infra`
 - built-in specialties: `frontend`, `infra`, `ux`, `security`, `release`
 - user-defined specialties can be added per workspace
 
@@ -149,10 +156,74 @@ Sessions make agent presence explicit so `lex` can distinguish a live owner from
 ```bash
 python3 -m lex.cli agent identify codex --role dev --specialty frontend
 python3 -m lex.cli session start codex-brisk-otter --label primary
+python3 -m lex.cli session bootstrap-show 1
+python3 -m lex.cli session bootstrap-ack 1 --by human
+python3 -m lex.cli session action 1 review_inbox
 python3 -m lex.cli session heartbeat 1
 python3 -m lex.cli session list --active-only
 python3 -m lex.cli task show 2
 python3 -m lex.cli session end 1
+```
+
+Role guards apply to task verbs. For example, a `pm` session is expected to review inbox, inspect child work, and delegate before acting freely, and `task claim` is blocked unless you explicitly override the role contract:
+
+```bash
+python3 -m lex.cli task claim 7 codex-pm-dalton
+python3 -m lex.cli task claim 7 codex-pm-dalton --force-role-override
+```
+
+## Watches
+
+Subscriptions now track delivery and acknowledgement state.
+
+```bash
+python3 -m lex.cli watch add codex-brisk-otter 3
+python3 -m lex.cli watch list --agent codex-brisk-otter
+python3 -m lex.cli watch ack codex-brisk-otter 3
+```
+
+## Supervised Workers
+
+Lex can now supervise approved local worker processes and deliver structured task packets into worker inboxes under `.lex/runtime/workers/`.
+
+```bash
+python3 -m lex.cli worker register codex-dev codex \
+  --role dev \
+  --command-json '["codex"]' \
+  --approval-policy always \
+  --created-by codex-pm-dalton
+
+python3 -m lex.cli worker request-start codex-dev \
+  --requested-by codex-pm-dalton \
+  --task-id 1 \
+  --reason "Need a supervised dev worker for child tasks"
+
+python3 -m lex.cli worker approve 1 approved --approved-by human
+python3 -m lex.cli worker start 1
+python3 -m lex.cli worker runtime-list
+```
+
+Worker runtimes expose:
+- `LEX_WORKER_INBOX`
+- `LEX_WORKER_RUNTIME_ID`
+- `LEX_DB_PATH`
+- `LEX_ROOT`
+
+The current dispatch layer writes structured task packets into the runtime inbox and tracks approval, delivery, acknowledgement, and completion state in the Lex database.
+
+```bash
+python3 -m lex.cli dispatch create \
+  --task-id 1 \
+  --from codex-pm-dalton \
+  --to-worker codex-dev \
+  --summary "Implement child task" \
+  --body "Read the assigned task packet and report completion back into Lex." \
+  --require-approval
+
+python3 -m lex.cli dispatch approve 1 approved --approved-by human
+python3 -m lex.cli dispatch send 1 --runtime-id 1
+python3 -m lex.cli dispatch ack 1 --runtime-id 1 --note "accepted"
+python3 -m lex.cli dispatch complete 1 completed --note "merged into feature branch"
 ```
 
 ## Agent Roles
@@ -183,3 +254,4 @@ Recommended mapping:
 - `dev`: implementation and technical execution
 - `pm`: planning, design, scoping, release coordination
 - `auditor`: review, verification, compliance, regression checking
+- `infra`: integration, merge coordination, release plumbing

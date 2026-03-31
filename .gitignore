@@ -6,3 +6,10 @@ tests/__pycache__/
 src/*.egg-info/
 tests/__pycache__/
 .pytest_cache/
+
+# lex ignore policy
+<!-- lex:begin -->
+.lex/lex.db
+.lex/runtime/
+.lex/
+<!-- lex:end -->

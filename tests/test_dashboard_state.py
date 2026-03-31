@@ -132,3 +132,42 @@ def test_dashboard_state_flags_stale_sessions_and_expiring_leases(tmp_path):
     assert state.sessions[0]["is_stale"] == 1
     assert state.tasks[0]["lease_expiring"] == 1
     assert state.task_details[task_id]["lease_expiring"] == 1
+
+
+def test_dashboard_state_surfaces_bootstrap_and_ack_compliance(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-pm-dalton', 'codex', 'pm', '', 'active')")
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, cwd, capabilities_json)
+        VALUES (1, 'primary', 'active', ?, '{}')
+        """,
+        (str(tmp_path),),
+    )
+    conn.execute(
+        """
+        INSERT INTO session_bootstraps (
+            session_id, agent_id, role_contract_json, memory_json, system_prompt, workflow_template_json, required_actions_json
+        )
+        VALUES (1, 1, '{}', '{}', '', '[]', '["review_inbox","assign_or_delegate_work"]')
+        """
+    )
+    conn.execute("INSERT INTO tasks (title) VALUES ('Watched task')")
+    conn.execute("INSERT INTO watches (agent_id, task_id, last_sent_event_id, last_ack_event_id) VALUES (1, 1, 3, 1)")
+    conn.execute(
+        """
+        INSERT INTO events (event_type, agent_id, session_id, payload_json)
+        VALUES ('role.drift_detected', 1, 1, '{}')
+        """
+    )
+    conn.commit()
+
+    state = load_dashboard_state(tmp_path)
+
+    assert state.sessions[0]["bootstrap_pending"] == 1
+    assert state.sessions[0]["pending_required_actions"] == 2
+    assert state.sessions[0]["unacked_watches"] == 1
+    assert state.sessions[0]["role_drift_events"] == 1

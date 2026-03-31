@@ -122,6 +122,12 @@ Use the shared protocol in `.lex/adapters/shared/protocol.md`.
 
 Cursor participates through the same task and message model.
 """,
+    ".lex/adapters/gemini/GEMINI.md": """# Gemini Adapter
+
+Read `.lex/ROUTER.md` before starting work.
+
+Use the shared protocol in `.lex/adapters/shared/protocol.md`.
+""",
 }
 
 

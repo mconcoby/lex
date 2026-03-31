@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sqlite3
 import socket
 import sys
@@ -14,8 +15,20 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from lex.db import BUILTIN_SPECIALTIES, connect, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths
+from lex.dispatch import (
+    VALID_WORKER_APPROVAL_POLICIES,
+    command_preview,
+    decode_json_list,
+    decode_json_object,
+    launch_worker_supervisor,
+    should_require_packet_approval,
+    should_require_runtime_approval,
+    stop_runtime_process,
+    worker_runtime_dir,
+)
 from lex.installer import InstallContext, inspect_install_context, install_scaffold
 from lex.merge_workflow import apply_proposal, create_merge_packet, resolve_merge_paths, unified_diff
+from lex.role_contracts import ROLE_ACTION_LABELS, ROLE_CONTRACTS, get_role_contract
 from lex.rich_output import (
     console,
     print_ok,
@@ -31,7 +44,7 @@ from lex.rich_output import (
 from lex.tui import run_tui
 
 
-AGENT_NAME_RE = re.compile(r"^(codex|claude|cursor)-[a-z]+-[a-z]+$")
+AGENT_NAME_RE = re.compile(r"^(codex|claude|cursor|gemini)-[a-z]+-[a-z]+$")
 AGENT_ADJECTIVES = (
     "brisk",
     "calm",
@@ -56,7 +69,7 @@ AGENT_NOUNS = (
     "stoat",
     "wren",
 )
-CANONICAL_AGENT_ROLES = {"dev", "pm", "auditor"}
+CANONICAL_AGENT_ROLES = {"dev", "pm", "auditor", "infra"}
 VALID_TASK_STATES = {
     "open",
     "claimed",
@@ -79,6 +92,9 @@ VALID_MESSAGE_TYPES = {
     "artifact_notice",
 }
 SESSION_STALE_MINUTES = 15
+VALID_RUNTIME_APPROVAL_STATUSES = {"pending_approval", "approved", "rejected", "not_required"}
+VALID_RUNTIME_STOP_SIGNALS = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "INT": signal.SIGINT}
+VALID_PACKET_APPROVAL_STATUSES = {"pending_approval", "approved", "rejected", "not_required"}
 
 
 def emit_json(data: object) -> None:
@@ -214,6 +230,348 @@ def get_active_session_for_agent(conn: sqlite3.Connection, agent_id: int):
         """,
         (agent_id,),
     )
+
+
+def get_latest_session_for_agent(conn: sqlite3.Connection, agent_id: int):
+    return fetch_one(
+        conn,
+        """
+        SELECT
+            s.*,
+            a.name AS agent_name,
+            a.kind AS agent_kind
+        FROM sessions s
+        JOIN agents a ON a.id = s.agent_id
+        WHERE s.agent_id = ?
+        ORDER BY s.id DESC
+        LIMIT 1
+        """,
+        (agent_id,),
+    )
+
+
+def get_session_bootstrap(conn: sqlite3.Connection, session_id: int):
+    row = fetch_one(
+        conn,
+        """
+        SELECT *
+        FROM session_bootstraps
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+    if row is not None:
+        return row
+    session = get_session(conn, session_id)
+    agent = get_agent(conn, session["agent_name"])
+    try:
+        create_session_bootstrap(conn, session_id=session_id, agent=agent)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+    row = fetch_one(
+        conn,
+        """
+        SELECT *
+        FROM session_bootstraps
+        WHERE session_id = ?
+        """,
+        (session_id,),
+    )
+    if row is None:
+        raise SystemExit(f"missing session bootstrap for session: {session_id}")
+    return row
+
+
+def get_active_bootstrap_for_agent(conn: sqlite3.Connection, agent_id: int):
+    return fetch_one(
+        conn,
+        """
+        SELECT sb.*
+        FROM session_bootstraps sb
+        JOIN sessions s ON s.id = sb.session_id
+        WHERE sb.agent_id = ?
+          AND s.status = 'active'
+          AND s.ended_at IS NULL
+        ORDER BY sb.id DESC
+        LIMIT 1
+        """,
+        (agent_id,),
+    )
+
+
+def get_worker_definition(conn: sqlite3.Connection, name: str):
+    row = fetch_one(conn, "SELECT * FROM worker_definitions WHERE name = ?", (name,))
+    if row is None:
+        raise SystemExit(f"unknown worker definition: {name}")
+    return row
+
+
+def get_worker_runtime(conn: sqlite3.Connection, runtime_id: int):
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            wr.*,
+            wd.name AS worker_name,
+            wd.kind AS worker_kind,
+            wd.role AS worker_role,
+            wd.specialty AS worker_specialty
+        FROM worker_runtimes wr
+        JOIN worker_definitions wd ON wd.id = wr.worker_id
+        WHERE wr.id = ?
+        """,
+        (runtime_id,),
+    )
+    if row is None:
+        raise SystemExit(f"unknown worker runtime: {runtime_id}")
+    return row
+
+
+def get_dispatch_packet(conn: sqlite3.Connection, packet_id: int):
+    row = fetch_one(
+        conn,
+        """
+        SELECT
+            dp.*,
+            sender.name AS from_agent_name,
+            wd.name AS worker_name,
+            wr.status AS runtime_status
+        FROM dispatch_packets dp
+        JOIN agents sender ON sender.id = dp.from_agent_id
+        LEFT JOIN worker_definitions wd ON wd.id = dp.to_worker_id
+        LEFT JOIN worker_runtimes wr ON wr.id = dp.runtime_id
+        WHERE dp.id = ?
+        """,
+        (packet_id,),
+    )
+    if row is None:
+        raise SystemExit(f"unknown dispatch packet: {packet_id}")
+    return row
+
+
+def _fetch_bootstrap_memory(conn: sqlite3.Connection, agent_id: int) -> dict:
+    owned_tasks = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT id, title, status, priority
+            FROM tasks
+            WHERE owner_agent_id = ?
+              AND status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending', 'open')
+            ORDER BY id DESC
+            LIMIT 8
+            """,
+            (agent_id,),
+        ).fetchall()
+    ]
+    watched_tasks = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+                w.task_id,
+                t.title,
+                w.last_sent_event_id,
+                w.last_ack_event_id
+            FROM watches w
+            JOIN tasks t ON t.id = w.task_id
+            WHERE w.agent_id = ?
+            ORDER BY w.id DESC
+            LIMIT 8
+            """,
+            (agent_id,),
+        ).fetchall()
+    ]
+    inbox = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+                m.id,
+                m.task_id,
+                sender.name AS from_name,
+                m.type,
+                m.subject,
+                m.body,
+                m.created_at
+            FROM messages m
+            JOIN agents sender ON sender.id = m.from_agent_id
+            WHERE m.to_agent_id = ?
+               OR (
+                    m.to_agent_id IS NULL
+                    AND m.task_id IS NOT NULL
+                    AND EXISTS (
+                        SELECT 1 FROM tasks t WHERE t.id = m.task_id AND t.owner_agent_id = ?
+                    )
+               )
+            ORDER BY m.id DESC
+            LIMIT 8
+            """,
+            (agent_id, agent_id),
+        ).fetchall()
+    ]
+    recent_decisions = [
+        dict(row)
+        for row in conn.execute(
+            """
+            SELECT
+                e.id,
+                e.event_type,
+                e.task_id,
+                e.created_at,
+                e.payload_json
+            FROM events e
+            WHERE e.event_type IN ('message.sent', 'task.delegated', 'task.priority_changed', 'task.handoff', 'dispatch.packet_completed')
+            ORDER BY e.id DESC
+            LIMIT 8
+            """
+        ).fetchall()
+    ]
+    return {
+        "active_tasks": owned_tasks,
+        "subscriptions": watched_tasks,
+        "inbox": inbox,
+        "recent_decisions": recent_decisions,
+    }
+
+
+def create_session_bootstrap(conn: sqlite3.Connection, *, session_id: int, agent) -> None:
+    contract = get_role_contract(agent["role"])
+    previous_session = fetch_one(
+        conn,
+        """
+        SELECT id
+        FROM sessions
+        WHERE agent_id = ? AND id != ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (agent["id"], session_id),
+    )
+    memory = _fetch_bootstrap_memory(conn, agent["id"])
+    role_contract = {
+        "role": contract.role if contract else agent["role"],
+        "allowed_verbs": list(contract.allowed_verbs) if contract else [],
+        "blocked_verbs": list(contract.blocked_verbs) if contract else [],
+        "required_first_actions": list(contract.required_first_actions) if contract else [],
+    }
+    conn.execute(
+        """
+        INSERT INTO session_bootstraps (
+            session_id, agent_id, continuity_from_session_id, role_contract_json, memory_json,
+            system_prompt, workflow_template_json, required_actions_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            session_id,
+            agent["id"],
+            previous_session["id"] if previous_session else None,
+            json.dumps(role_contract),
+            json.dumps(memory),
+            contract.system_prompt if contract else "",
+            json.dumps(list(contract.workflow_template) if contract else []),
+            json.dumps(list(contract.required_first_actions) if contract else []),
+        ),
+    )
+    log_event(
+        conn,
+        "session.bootstrap_generated",
+        agent_id=agent["id"],
+        session_id=session_id,
+        payload={
+            "continuity_from_session_id": previous_session["id"] if previous_session else None,
+            "role": agent["role"],
+            "required_actions": list(contract.required_first_actions) if contract else [],
+        },
+    )
+
+
+def complete_session_action(conn: sqlite3.Connection, *, session_id: int, action_key: str, detail: dict | None = None) -> bool:
+    bootstrap = get_session_bootstrap(conn, session_id)
+    required_actions = set(json.loads(bootstrap["required_actions_json"]))
+    if action_key not in required_actions:
+        return False
+    conn.execute(
+        """
+        INSERT INTO session_action_receipts (session_id, action_key, detail_json)
+        VALUES (?, ?, ?)
+        ON CONFLICT(session_id, action_key)
+        DO UPDATE SET detail_json = excluded.detail_json, created_at = CURRENT_TIMESTAMP
+        """,
+        (session_id, action_key, json.dumps(detail or {})),
+    )
+    log_event(
+        conn,
+        "session.required_action_completed",
+        agent_id=bootstrap["agent_id"],
+        session_id=session_id,
+        payload={"action_key": action_key},
+    )
+    return True
+
+
+def get_pending_required_actions(conn: sqlite3.Connection, session_id: int) -> list[str]:
+    bootstrap = get_session_bootstrap(conn, session_id)
+    required_actions = json.loads(bootstrap["required_actions_json"])
+    completed = {
+        row["action_key"]
+        for row in conn.execute(
+            "SELECT action_key FROM session_action_receipts WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+    }
+    return [action for action in required_actions if action not in completed]
+
+
+def enforce_role_contract(conn: sqlite3.Connection, *, agent, verb: str, allow_override: bool = False) -> None:
+    contract = get_role_contract(agent["role"])
+    if contract is None:
+        return
+    active_session = get_active_session_for_agent(conn, agent["id"])
+    if active_session is not None:
+        bootstrap = get_session_bootstrap(conn, active_session["id"])
+        if bootstrap["acknowledged_at"] is None and verb not in {"session_bootstrap_show", "session_bootstrap_ack", "msg_inbox", "task_list", "task_show"}:
+            log_event(
+                conn,
+                "role.drift_detected",
+                agent_id=agent["id"],
+                session_id=active_session["id"],
+                payload={"verb": verb, "reason": "bootstrap_not_acknowledged", "role": agent["role"]},
+            )
+            conn.commit()
+            raise SystemExit("session bootstrap must be acknowledged before acting")
+        pending_actions = get_pending_required_actions(conn, active_session["id"])
+        if pending_actions and verb not in {"session_bootstrap_show", "session_bootstrap_ack", "session_action", "msg_inbox", "task_list", "task_show", "task_delegate"}:
+            log_event(
+                conn,
+                "role.drift_detected",
+                agent_id=agent["id"],
+                session_id=active_session["id"],
+                payload={"verb": verb, "reason": "required_actions_pending", "pending_actions": pending_actions},
+            )
+            conn.commit()
+            raise SystemExit(f"session bootstrap actions still pending: {', '.join(pending_actions)}")
+    if verb in contract.blocked_verbs:
+        if allow_override:
+            log_event(
+                conn,
+                "role.override_used",
+                agent_id=agent["id"],
+                session_id=active_session["id"] if active_session else None,
+                payload={"verb": verb, "role": agent["role"]},
+            )
+            return
+        log_event(
+            conn,
+            "role.drift_detected",
+            agent_id=agent["id"],
+            session_id=active_session["id"] if active_session else None,
+            payload={"verb": verb, "reason": "blocked_by_role_contract", "role": agent["role"]},
+        )
+        conn.commit()
+        raise SystemExit(f"role {agent['role']} is not allowed to perform {verb} without explicit override")
 
 
 def release_stale_leases(conn: sqlite3.Connection) -> int:
@@ -384,7 +742,7 @@ def run_interactive_shell(root: Path) -> None:
                     name=prompt_text("Agent name"),
                     kind=prompt_choice(
                         "Agent kind",
-                        [("codex", "Codex"), ("claude", "Claude"), ("cursor", "Cursor")],
+                        [("codex", "Codex"), ("claude", "Claude"), ("cursor", "Cursor"), ("gemini", "Gemini")],
                         "codex",
                     ),
                 )
@@ -843,15 +1201,203 @@ def cmd_session_start(args: argparse.Namespace) -> None:
         session_id=session_id,
         payload={"label": args.label, "cwd": args.cwd, "fingerprint": fingerprint, "fingerprint_label": fingerprint_label},
     )
+    create_session_bootstrap(conn, session_id=session_id, agent=agent)
     conn.commit()
     print_ok(f"started session {session_id} for {args.agent}")
     print_info(f"instance {fingerprint_label} ({fingerprint})")
+    print_info(f"bootstrap packet ready: lex session bootstrap-show {session_id}")
     if conflicting_sessions:
         other = conflicting_sessions[0]
         print_info(
             "warning: another active session exists for this agent "
             f"(session {other['id']} {other['label'] or '-'} @ {other['fingerprint_label'] or '-'})"
         )
+
+
+def cmd_session_bootstrap_show(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    session = get_session(conn, args.session_id)
+    bootstrap = get_session_bootstrap(conn, args.session_id)
+    pending_actions = get_pending_required_actions(conn, args.session_id)
+    data = {
+        "session_id": args.session_id,
+        "agent": session["agent_name"],
+        "role_contract": json.loads(bootstrap["role_contract_json"]),
+        "system_prompt": bootstrap["system_prompt"],
+        "workflow_template": json.loads(bootstrap["workflow_template_json"]),
+        "memory": json.loads(bootstrap["memory_json"]),
+        "required_actions": json.loads(bootstrap["required_actions_json"]),
+        "pending_actions": pending_actions,
+        "acknowledged_at": bootstrap["acknowledged_at"],
+        "acknowledged_by": bootstrap["acknowledged_by"],
+        "continuity_from_session_id": bootstrap["continuity_from_session_id"],
+    }
+    if args.json:
+        emit_json(data)
+        return
+    print(f"session {args.session_id} bootstrap for {session['agent_name']}")
+    print(f"role: {json.loads(bootstrap['role_contract_json']).get('role') or '-'}")
+    if bootstrap["continuity_from_session_id"] is not None:
+        print(f"continuity from session: {bootstrap['continuity_from_session_id']}")
+    print("")
+    print("system prompt:")
+    print(f"  {bootstrap['system_prompt']}")
+    print("")
+    print("workflow template:")
+    for item in json.loads(bootstrap["workflow_template_json"]):
+        print(f"  - {item}")
+    print("")
+    print("required first actions:")
+    for action in json.loads(bootstrap["required_actions_json"]):
+        label = ROLE_ACTION_LABELS.get(action, action)
+        suffix = " (pending)" if action in pending_actions else " (done)"
+        print(f"  - {label}{suffix}")
+    print("")
+    print("hydrated memory:")
+    memory = json.loads(bootstrap["memory_json"])
+    print(f"  active tasks: {len(memory.get('active_tasks', []))}")
+    print(f"  subscriptions: {len(memory.get('subscriptions', []))}")
+    print(f"  inbox items: {len(memory.get('inbox', []))}")
+    print(f"  recent decisions: {len(memory.get('recent_decisions', []))}")
+
+
+def cmd_prompt_create(args: argparse.Namespace) -> None:
+    contract = ROLE_CONTRACTS.get(args.role.lower())
+    if contract is None:
+        valid = ", ".join(sorted(ROLE_CONTRACTS))
+        raise SystemExit(f"unknown role '{args.role}' — valid roles: {valid}")
+
+    live_state: dict | None = None
+    if args.agent:
+        paths = resolve_paths(args.root)
+        conn = connect(paths.db_path)
+        initialize_database(conn)
+        agent = fetch_one(conn, "SELECT * FROM agents WHERE name = ?", (args.agent,))
+        if agent is None:
+            raise SystemExit(f"agent not found: {args.agent}")
+        live_state = _fetch_bootstrap_memory(conn, agent["id"])
+
+    if args.json:
+        data: dict = {
+            "role": contract.role,
+            "system_prompt": contract.system_prompt,
+            "workflow": list(contract.workflow_template),
+            "allowed_verbs": list(contract.allowed_verbs),
+            "blocked_verbs": list(contract.blocked_verbs),
+            "required_first_actions": [
+                {"key": a, "label": ROLE_ACTION_LABELS.get(a, a)}
+                for a in contract.required_first_actions
+            ],
+        }
+        if live_state is not None:
+            data["live_state"] = live_state
+        emit_json(data)
+        return
+
+    lines: list[str] = []
+    lines.append(f"# Lex — {contract.role.upper()} Prompt")
+    lines.append("")
+    lines.append("## Identity")
+    lines.append(contract.system_prompt)
+    lines.append("")
+    lines.append("## Protocol")
+    for rule in (
+        "Claim a task before making substantive changes.",
+        "Renew leases while active on a claimed task.",
+        "Use task-threaded messages for progress, blockers, and handoffs.",
+        "Only the current owner may change task status.",
+        "Hypervisor delegation creates child tasks instead of sharing write ownership.",
+    ):
+        lines.append(f"- {rule}")
+    lines.append("")
+    lines.append("## Workflow")
+    for i, step in enumerate(contract.workflow_template, 1):
+        lines.append(f"{i}. {step}")
+    lines.append("")
+    lines.append("## Required First Actions")
+    for action in contract.required_first_actions:
+        lines.append(f"- {ROLE_ACTION_LABELS.get(action, action)}")
+    lines.append("")
+    lines.append("## Permissions")
+    allowed = ", ".join(contract.allowed_verbs) if contract.allowed_verbs else "all"
+    blocked = ", ".join(contract.blocked_verbs) if contract.blocked_verbs else "none"
+    lines.append(f"Allowed verbs: {allowed}")
+    lines.append(f"Blocked verbs: {blocked}")
+
+    if live_state is not None:
+        lines.append("")
+        lines.append("## Live State")
+        active = live_state.get("active_tasks", [])
+        if active:
+            lines.append("")
+            lines.append("### Active Tasks")
+            for t in active:
+                lines.append(f"- [{t['id']}] {t['title']} ({t['status']}, priority {t['priority']})")
+        inbox = live_state.get("inbox", [])
+        if inbox:
+            lines.append("")
+            lines.append("### Inbox")
+            for m in inbox:
+                task_ref = f" [task {m['task_id']}]" if m.get("task_id") else ""
+                lines.append(f"- from {m['from_name']}{task_ref}: {m['subject'] or m['type']}")
+        subs = live_state.get("subscriptions", [])
+        if subs:
+            lines.append("")
+            lines.append("### Watched Tasks")
+            for w in subs:
+                lines.append(f"- [{w['task_id']}] {w['title']}")
+
+    print("\n".join(lines))
+
+
+def cmd_session_bootstrap_ack(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    session = get_session(conn, args.session_id)
+    get_session_bootstrap(conn, args.session_id)
+    conn.execute(
+        """
+        UPDATE session_bootstraps
+        SET acknowledged_at = CURRENT_TIMESTAMP,
+            acknowledged_by = ?
+        WHERE session_id = ?
+        """,
+        (args.by, args.session_id),
+    )
+    log_event(
+        conn,
+        "session.bootstrap_acknowledged",
+        agent_id=session["agent_id"],
+        session_id=args.session_id,
+        payload={"acknowledged_by": args.by},
+    )
+    conn.commit()
+    print_ok(f"acknowledged bootstrap for session {args.session_id}")
+
+
+def cmd_session_action_complete(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    session = get_session(conn, args.session_id)
+    completed = complete_session_action(
+        conn,
+        session_id=args.session_id,
+        action_key=args.action_key,
+        detail={"note": args.note or ""},
+    )
+    if not completed:
+        raise SystemExit(f"action is not required for this session: {args.action_key}")
+    conn.commit()
+    pending = get_pending_required_actions(conn, args.session_id)
+    print_ok(f"recorded session action {args.action_key} for session {args.session_id}")
+    if pending:
+        print_info(f"pending actions: {', '.join(pending)}")
+    else:
+        print_info(f"session {args.session_id} is fully bootstrapped for {session['agent_name']}")
 
 
 def cmd_session_heartbeat(args: argparse.Namespace) -> None:
@@ -915,6 +1461,8 @@ def cmd_session_list(args: argparse.Namespace) -> None:
             s.id,
             a.name AS agent_name,
             a.kind AS agent_kind,
+            a.role AS agent_role,
+            a.specialty AS agent_specialty,
             s.label,
             s.fingerprint,
             s.fingerprint_label,
@@ -942,7 +1490,9 @@ def cmd_task_create(args: argparse.Namespace) -> None:
     initialize_database(conn)
     creator_id = None
     if args.created_by:
-        creator_id = get_agent(conn, args.created_by)["id"]
+        creator = get_agent(conn, args.created_by)
+        enforce_role_contract(conn, agent=creator, verb="task_create", allow_override=args.force_role_override)
+        creator_id = creator["id"]
     claimed_paths = args.path or []
     conn.execute(
         """
@@ -1006,6 +1556,27 @@ def cmd_task_show(args: argparse.Namespace) -> None:
     initialize_database(conn)
     release_stale_leases(conn)
     task = get_task_with_owner(conn, args.task_id)
+    if args.agent:
+        agent = get_agent(conn, args.agent)
+        active_session = get_active_session_for_agent(conn, agent["id"])
+        if active_session is not None:
+            action_key = None
+            if agent["role"] == "pm" and task["parent_task_id"] is None:
+                action_key = "inspect_open_child_tasks"
+            elif agent["role"] == "dev":
+                action_key = "inspect_assigned_tasks"
+            elif agent["role"] == "auditor":
+                action_key = "inspect_review_queue"
+            elif agent["role"] == "infra":
+                action_key = "inspect_integration_queue"
+            if action_key is not None:
+                complete_session_action(
+                    conn,
+                    session_id=active_session["id"],
+                    action_key=action_key,
+                    detail={"task_id": args.task_id},
+                )
+                conn.commit()
     lease = get_active_lease(conn, args.task_id)
     owner_session = None
     if task["owner_agent_id"] is not None:
@@ -1076,6 +1647,7 @@ def cmd_task_delegate(args: argparse.Namespace) -> None:
     initialize_database(conn)
     parent_task = get_task(conn, args.parent_task_id)
     owner = get_agent(conn, args.owner_agent)
+    enforce_role_contract(conn, agent=owner, verb="task_delegate", allow_override=args.force_role_override)
     assignee = get_agent(conn, args.assignee_agent)
     assignee_session = get_active_session_for_agent(conn, assignee["id"])
     if parent_task["owner_agent_id"] not in (None, owner["id"]):
@@ -1129,6 +1701,14 @@ def cmd_task_delegate(args: argparse.Namespace) -> None:
         agent_id=owner["id"],
         payload={"parent_task_id": args.parent_task_id, "assignee": args.assignee_agent},
     )
+    owner_session = get_active_session_for_agent(conn, owner["id"])
+    if owner_session is not None:
+        complete_session_action(
+            conn,
+            session_id=owner_session["id"],
+            action_key="assign_or_delegate_work",
+            detail={"child_task_id": child_task_id},
+        )
     conn.commit()
     print_ok(f"delegated child task {child_task_id} to {args.assignee_agent}")
 
@@ -1140,6 +1720,7 @@ def cmd_task_claim(args: argparse.Namespace) -> None:
     release_stale_leases(conn)
     task = get_task(conn, args.task_id)
     agent = get_agent(conn, args.agent)
+    enforce_role_contract(conn, agent=agent, verb="task_claim", allow_override=args.force_role_override)
     session = get_active_session_for_agent(conn, agent["id"])
     active_lease = fetch_one(
         conn,
@@ -1187,6 +1768,7 @@ def cmd_task_update_priority(args: argparse.Namespace) -> None:
     initialize_database(conn)
     task = get_task(conn, args.task_id)
     agent = get_agent(conn, args.agent)
+    enforce_role_contract(conn, agent=agent, verb="task_priority", allow_override=args.force_role_override)
     if task["owner_agent_id"] not in (None, agent["id"]):
         raise SystemExit("only the owner may update task priority")
     conn.execute(
@@ -1212,6 +1794,7 @@ def cmd_task_update_status(args: argparse.Namespace) -> None:
     initialize_database(conn)
     task = get_task(conn, args.task_id)
     agent = get_agent(conn, args.agent)
+    enforce_role_contract(conn, agent=agent, verb="task_status", allow_override=args.force_role_override)
     if task["owner_agent_id"] not in (None, agent["id"]):
         raise SystemExit("only the owner may update task status")
     completed_at = "CURRENT_TIMESTAMP" if args.status == "done" else None
@@ -1242,6 +1825,7 @@ def cmd_task_handoff(args: argparse.Namespace) -> None:
     initialize_database(conn)
     task = get_task(conn, args.task_id)
     from_agent = get_agent(conn, args.from_agent)
+    enforce_role_contract(conn, agent=from_agent, verb="task_handoff", allow_override=args.force_role_override)
     to_agent = get_agent(conn, args.to_agent)
     if task["owner_agent_id"] not in (None, from_agent["id"]):
         raise SystemExit("only the owner may hand off the task")
@@ -1302,12 +1886,526 @@ def cmd_lease_renew(args: argparse.Namespace) -> None:
     print_ok(f"renewed lease for task {args.task_id}")
 
 
+def cmd_worker_register(args: argparse.Namespace) -> None:
+    paths = ensure_workspace(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    role = normalize_agent_role(args.role)
+    specialty = normalize_agent_specialty(conn, args.specialty)
+    created_by_id = get_agent(conn, args.created_by)["id"] if args.created_by else None
+    command = decode_json_list(args.command_json, field_name="command_json")
+    env = decode_json_object(args.env_json, field_name="env_json")
+    if not command:
+        raise SystemExit("command_json must not be empty")
+    try:
+        conn.execute(
+            """
+            INSERT INTO worker_definitions (
+                name, kind, role, specialty, command_json, cwd, env_json, approval_policy, created_by_agent_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                args.name,
+                args.kind,
+                role,
+                specialty,
+                json.dumps(command),
+                args.cwd,
+                json.dumps(env),
+                args.approval_policy,
+                created_by_id,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise SystemExit(f"failed to register worker definition: {exc}") from exc
+    worker_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    log_event(
+        conn,
+        "worker.definition_registered",
+        agent_id=created_by_id,
+        payload={"worker_id": worker_id, "name": args.name, "kind": args.kind},
+    )
+    conn.commit()
+    print_ok(f"registered worker {args.name}")
+
+
+def cmd_worker_list(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            wd.id,
+            wd.name,
+            wd.kind,
+            wd.role,
+            wd.specialty,
+            wd.approval_policy,
+            wd.command_json,
+            wd.cwd,
+            (
+                SELECT wr.status
+                FROM worker_runtimes wr
+                WHERE wr.worker_id = wd.id
+                ORDER BY wr.id DESC
+                LIMIT 1
+            ) AS latest_runtime_status
+        FROM worker_definitions wd
+        ORDER BY wd.id
+        """
+    ).fetchall()
+    data = []
+    for row in rows:
+        item = dict(row)
+        item["command"] = json.loads(item.pop("command_json"))
+        data.append(item)
+    if args.json:
+        emit_json(data)
+        return
+    for row in data:
+        role = row["role"] or "-"
+        if row["specialty"]:
+            role = f"{role}/{row['specialty']}"
+        print(
+            f"{row['id']:>3}  {row['name']:<24} {row['kind']:<7} "
+            f"{role:<16} {row['approval_policy']:<12} {row.get('latest_runtime_status') or '-':<16} "
+            f"{command_preview(row['command'])}"
+        )
+
+
+def cmd_worker_request_start(args: argparse.Namespace) -> None:
+    paths = ensure_workspace(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    worker = get_worker_definition(conn, args.worker)
+    requester = get_agent(conn, args.requested_by)
+    if args.task_id is not None:
+        get_task(conn, args.task_id)
+    approval_required = should_require_runtime_approval(
+        policy=worker["approval_policy"],
+        sensitive_action=args.sensitive_action,
+    )
+    if approval_required:
+        approval_status = "approved" if args.approved_by else "pending_approval"
+        runtime_status = "approved" if args.approved_by else "pending_approval"
+    else:
+        approval_status = "not_required"
+        runtime_status = "approved"
+    conn.execute(
+        """
+        INSERT INTO worker_runtimes (
+            worker_id, task_id, requested_by_agent_id, reason, sensitive_action,
+            approval_required, approval_status, approved_by, approved_at, status,
+            command_json, cwd
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END, ?, ?, ?)
+        """,
+        (
+            worker["id"],
+            args.task_id,
+            requester["id"],
+            args.reason or "",
+            args.sensitive_action or "",
+            1 if approval_required else 0,
+            approval_status,
+            args.approved_by,
+            args.approved_by,
+            runtime_status,
+            worker["command_json"],
+            args.cwd or worker["cwd"] or str(paths.root),
+        ),
+    )
+    runtime_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    log_event(
+        conn,
+        "worker.runtime_requested",
+        task_id=args.task_id,
+        agent_id=requester["id"],
+        payload={
+            "runtime_id": runtime_id,
+            "worker_name": worker["name"],
+            "approval_required": approval_required,
+            "sensitive_action": args.sensitive_action or "",
+        },
+    )
+    conn.commit()
+    status_text = "pending approval" if approval_status == "pending_approval" else "ready to start"
+    print_ok(f"created worker runtime {runtime_id} for {args.worker}")
+    print_info(status_text)
+
+
+def cmd_worker_approve(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    runtime = get_worker_runtime(conn, args.runtime_id)
+    if args.decision not in {"approved", "rejected"}:
+        raise SystemExit("decision must be approved or rejected")
+    status = "approved" if args.decision == "approved" else "rejected"
+    runtime_status = "approved" if status == "approved" else "rejected"
+    conn.execute(
+        """
+        UPDATE worker_runtimes
+        SET approval_status = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP, status = ?
+        WHERE id = ?
+        """,
+        (status, args.approved_by, runtime_status, args.runtime_id),
+    )
+    log_event(
+        conn,
+        "worker.runtime_approval_updated",
+        task_id=runtime["task_id"],
+        agent_id=runtime["requested_by_agent_id"],
+        payload={"runtime_id": args.runtime_id, "decision": status, "approved_by": args.approved_by},
+    )
+    conn.commit()
+    print_ok(f"runtime {args.runtime_id} {status}")
+
+
+def cmd_worker_start(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    runtime = get_worker_runtime(conn, args.runtime_id)
+    if runtime["approval_required"] and runtime["approval_status"] != "approved":
+        raise SystemExit("runtime requires human approval before start")
+    if runtime["status"] in {"launching", "running"}:
+        raise SystemExit(f"runtime {args.runtime_id} is already {runtime['status']}")
+    conn.execute(
+        "UPDATE worker_runtimes SET status = 'launching', heartbeat_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (args.runtime_id,),
+    )
+    supervisor = launch_worker_supervisor(paths, args.runtime_id)
+    conn.execute(
+        "UPDATE worker_runtimes SET supervisor_pid = ? WHERE id = ?",
+        (supervisor.pid, args.runtime_id),
+    )
+    log_event(
+        conn,
+        "worker.runtime_launching",
+        task_id=runtime["task_id"],
+        agent_id=runtime["requested_by_agent_id"],
+        payload={"runtime_id": args.runtime_id, "worker_name": runtime["worker_name"]},
+    )
+    conn.commit()
+    print_ok(f"started worker runtime {args.runtime_id}")
+
+
+def cmd_worker_stop(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    runtime = get_worker_runtime(conn, args.runtime_id)
+    target_pid = runtime["child_pid"] or runtime["pid"] or runtime["supervisor_pid"]
+    if target_pid is not None:
+        try:
+            stop_runtime_process(target_pid, VALID_RUNTIME_STOP_SIGNALS[args.signal])
+        except ProcessLookupError:
+            pass
+    conn.execute(
+        """
+        UPDATE worker_runtimes
+        SET status = 'stopped',
+            heartbeat_at = CURRENT_TIMESTAMP,
+            ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP)
+        WHERE id = ?
+        """,
+        (args.runtime_id,),
+    )
+    log_event(
+        conn,
+        "worker.runtime_stopped",
+        task_id=runtime["task_id"],
+        agent_id=runtime["requested_by_agent_id"],
+        payload={"runtime_id": args.runtime_id, "signal": args.signal},
+    )
+    conn.commit()
+    print_ok(f"stopped worker runtime {args.runtime_id}")
+
+
+def cmd_worker_runtime_list(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            wr.id,
+            wr.task_id,
+            wr.status,
+            wr.approval_required,
+            wr.approval_status,
+            wr.reason,
+            wr.sensitive_action,
+            wr.pid,
+            wr.child_pid,
+            wr.exit_code,
+            wr.started_at,
+            wr.heartbeat_at,
+            wr.ended_at,
+            wd.name AS worker_name,
+            requester.name AS requested_by_name
+        FROM worker_runtimes wr
+        JOIN worker_definitions wd ON wd.id = wr.worker_id
+        LEFT JOIN agents requester ON requester.id = wr.requested_by_agent_id
+        ORDER BY wr.id DESC
+        """
+    ).fetchall()
+    data = [dict(row) for row in rows]
+    if args.json:
+        emit_json(data)
+        return
+    for row in data:
+        print(
+            f"{row['id']:>3}  {row['worker_name']:<24} {row['status']:<16} "
+            f"approval={row['approval_status']:<16} task={row['task_id'] or '-':<4} "
+            f"requested_by={row['requested_by_name'] or '-':<20} pid={row['child_pid'] or row['pid'] or '-'}"
+        )
+
+
+def cmd_dispatch_create(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    sender = get_agent(conn, args.from_agent)
+    worker = get_worker_definition(conn, args.to_worker)
+    if args.task_id is not None:
+        get_task(conn, args.task_id)
+    requires_approval = should_require_packet_approval(
+        requested=args.require_approval,
+        sensitive_action=args.sensitive_action,
+    )
+    approval_status = "approved" if args.approved_by else ("pending_approval" if requires_approval else "not_required")
+    delivery_status = "ready" if approval_status in {"approved", "not_required"} else "pending_approval"
+    packet = {
+        "summary": args.summary,
+        "body": args.body,
+        "artifacts": args.artifact or [],
+        "metadata": decode_json_object(args.metadata_json, field_name="metadata_json"),
+    }
+    conn.execute(
+        """
+        INSERT INTO dispatch_packets (
+            task_id, to_worker_id, from_agent_id, packet_json, sensitive_action,
+            requires_human_approval, approval_status, approved_by, approved_at, delivery_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? IS NULL THEN NULL ELSE CURRENT_TIMESTAMP END, ?)
+        """,
+        (
+            args.task_id,
+            worker["id"],
+            sender["id"],
+            json.dumps(packet),
+            args.sensitive_action or "",
+            1 if requires_approval else 0,
+            approval_status,
+            args.approved_by,
+            args.approved_by,
+            delivery_status,
+        ),
+    )
+    packet_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    log_event(
+        conn,
+        "dispatch.packet_created",
+        task_id=args.task_id,
+        agent_id=sender["id"],
+        payload={"packet_id": packet_id, "to_worker": args.to_worker, "requires_approval": requires_approval},
+    )
+    conn.commit()
+    print_ok(f"created dispatch packet {packet_id}")
+
+
+def cmd_dispatch_list(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    rows = conn.execute(
+        """
+        SELECT
+            dp.id,
+            dp.task_id,
+            dp.delivery_status,
+            dp.approval_status,
+            dp.sensitive_action,
+            dp.created_at,
+            dp.delivered_at,
+            sender.name AS from_agent_name,
+            wd.name AS worker_name,
+            wr.status AS runtime_status
+        FROM dispatch_packets dp
+        JOIN agents sender ON sender.id = dp.from_agent_id
+        LEFT JOIN worker_definitions wd ON wd.id = dp.to_worker_id
+        LEFT JOIN worker_runtimes wr ON wr.id = dp.runtime_id
+        ORDER BY dp.id DESC
+        """
+    ).fetchall()
+    data = [dict(row) for row in rows]
+    if args.json:
+        emit_json(data)
+        return
+    for row in data:
+        print(
+            f"{row['id']:>3}  task={row['task_id'] or '-':<4} {row['delivery_status']:<16} "
+            f"approval={row['approval_status']:<16} worker={row['worker_name'] or '-':<24} "
+            f"runtime={row['runtime_status'] or '-':<10} from={row['from_agent_name']}"
+        )
+
+
+def cmd_dispatch_approve(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    packet = get_dispatch_packet(conn, args.packet_id)
+    status = "approved" if args.decision == "approved" else "rejected"
+    delivery_status = "ready" if status == "approved" else "cancelled"
+    conn.execute(
+        """
+        UPDATE dispatch_packets
+        SET approval_status = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP, delivery_status = ?
+        WHERE id = ?
+        """,
+        (status, args.approved_by, delivery_status, args.packet_id),
+    )
+    log_event(
+        conn,
+        "dispatch.packet_approval_updated",
+        task_id=packet["task_id"],
+        agent_id=packet["from_agent_id"],
+        payload={"packet_id": args.packet_id, "decision": status, "approved_by": args.approved_by},
+    )
+    conn.commit()
+    print_ok(f"dispatch packet {args.packet_id} {status}")
+
+
+def cmd_dispatch_send(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    packet = get_dispatch_packet(conn, args.packet_id)
+    if packet["requires_human_approval"] and packet["approval_status"] != "approved":
+        raise SystemExit("dispatch packet requires human approval before delivery")
+    runtime = get_worker_runtime(conn, args.runtime_id) if args.runtime_id else None
+    if runtime is None:
+        runtime = fetch_one(
+            conn,
+            """
+            SELECT
+                wr.*,
+                wd.name AS worker_name,
+                wd.kind AS worker_kind,
+                wd.role AS worker_role,
+                wd.specialty AS worker_specialty
+            FROM worker_runtimes wr
+            JOIN worker_definitions wd ON wd.id = wr.worker_id
+            WHERE wr.worker_id = ? AND wr.status IN ('approved', 'launching', 'running')
+            ORDER BY wr.id DESC
+            LIMIT 1
+            """,
+            (packet["to_worker_id"],),
+        )
+    if runtime is None:
+        raise SystemExit("no running worker runtime available for packet delivery")
+    if runtime["status"] not in {"approved", "launching", "running"}:
+        raise SystemExit(f"worker runtime {runtime['id']} is not accepting packets")
+    runtime_dir = worker_runtime_dir(paths, runtime["id"])
+    inbox_path = Path(runtime["inbox_path"] or runtime_dir / "inbox")
+    inbox_path.mkdir(parents=True, exist_ok=True)
+    packet_path = inbox_path / f"packet-{args.packet_id}.json"
+    payload = {
+        "id": args.packet_id,
+        "task_id": packet["task_id"],
+        "from_agent": packet["from_agent_name"],
+        "to_worker": runtime["worker_name"],
+        "sensitive_action": packet["sensitive_action"],
+        "created_at": packet["created_at"],
+        "packet": json.loads(packet["packet_json"]),
+    }
+    packet_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    conn.execute(
+        """
+        UPDATE dispatch_packets
+        SET runtime_id = ?, delivery_path = ?, delivery_status = 'delivered', delivered_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (runtime["id"], str(packet_path), args.packet_id),
+    )
+    log_event(
+        conn,
+        "dispatch.packet_delivered",
+        task_id=packet["task_id"],
+        agent_id=packet["from_agent_id"],
+        payload={"packet_id": args.packet_id, "runtime_id": runtime["id"], "path": str(packet_path)},
+    )
+    conn.commit()
+    print_ok(f"delivered packet {args.packet_id} to runtime {runtime['id']}")
+
+
+def cmd_dispatch_ack(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    packet = get_dispatch_packet(conn, args.packet_id)
+    runtime = get_worker_runtime(conn, args.runtime_id) if args.runtime_id else None
+    if runtime is not None and packet["runtime_id"] not in (None, runtime["id"]):
+        raise SystemExit("packet is assigned to another runtime")
+    runtime_id = runtime["id"] if runtime is not None else packet["runtime_id"]
+    conn.execute(
+        """
+        UPDATE dispatch_packets
+        SET runtime_id = COALESCE(runtime_id, ?),
+            delivery_status = 'acknowledged',
+            acknowledged_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (runtime_id, args.packet_id),
+    )
+    log_event(
+        conn,
+        "dispatch.packet_acknowledged",
+        task_id=packet["task_id"],
+        agent_id=packet["from_agent_id"],
+        payload={"packet_id": args.packet_id, "runtime_id": runtime_id, "note": args.note or ""},
+    )
+    conn.commit()
+    print_ok(f"acknowledged packet {args.packet_id}")
+
+
+def cmd_dispatch_complete(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    packet = get_dispatch_packet(conn, args.packet_id)
+    if args.status not in {"completed", "failed", "cancelled"}:
+        raise SystemExit("status must be completed, failed, or cancelled")
+    conn.execute(
+        """
+        UPDATE dispatch_packets
+        SET delivery_status = ?, completed_at = CURRENT_TIMESTAMP, completion_note = ?
+        WHERE id = ?
+        """,
+        (args.status, args.note or "", args.packet_id),
+    )
+    log_event(
+        conn,
+        "dispatch.packet_completed",
+        task_id=packet["task_id"],
+        agent_id=packet["from_agent_id"],
+        payload={"packet_id": args.packet_id, "status": args.status, "note": args.note or ""},
+    )
+    conn.commit()
+    print_ok(f"packet {args.packet_id} marked {args.status}")
+
+
 def cmd_msg_send(args: argparse.Namespace) -> None:
     require_message_type(args.type)
     paths = resolve_paths(args.root)
     conn = connect(paths.db_path)
     initialize_database(conn)
     from_agent = get_agent(conn, args.from_agent)
+    enforce_role_contract(conn, agent=from_agent, verb="msg_send", allow_override=False)
     to_agent = get_agent(conn, args.to_agent) if args.to_agent else None
     if args.task_id is not None:
         get_task(conn, args.task_id)
@@ -1332,6 +2430,20 @@ def cmd_msg_send(args: argparse.Namespace) -> None:
         agent_id=from_agent["id"],
         payload={"type": args.type, "to": args.to_agent},
     )
+    active_session = get_active_session_for_agent(conn, from_agent["id"])
+    if active_session is not None:
+        role_action = {
+            "dev": "report_execution_plan",
+            "auditor": "record_review_plan",
+            "infra": "record_integration_plan",
+        }.get(from_agent["role"])
+        if role_action is not None:
+            complete_session_action(
+                conn,
+                session_id=active_session["id"],
+                action_key=role_action,
+                detail={"message_type": args.type, "task_id": args.task_id},
+            )
     conn.commit()
     print_ok("message sent")
 
@@ -1341,6 +2453,15 @@ def cmd_msg_inbox(args: argparse.Namespace) -> None:
     conn = connect(paths.db_path)
     initialize_database(conn)
     agent = get_agent(conn, args.agent)
+    active_session = get_active_session_for_agent(conn, agent["id"])
+    if active_session is not None:
+        complete_session_action(
+            conn,
+            session_id=active_session["id"],
+            action_key="review_inbox",
+            detail={"source": "msg.inbox"},
+        )
+        conn.commit()
     def fetch_rows(since_id: int | None) -> list[sqlite3.Row]:
         params: list[object] = [agent["id"], agent["id"], agent["id"], agent["id"]]
         query = """
@@ -1408,6 +2529,103 @@ def cmd_msg_inbox(args: argparse.Namespace) -> None:
         poll_interval=args.poll_interval,
         max_polls=args.max_polls,
     )
+
+
+def cmd_watch_add(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent = get_agent(conn, args.agent)
+    enforce_role_contract(conn, agent=agent, verb="watch_add", allow_override=args.force_role_override)
+    get_task(conn, args.task_id)
+    try:
+        conn.execute(
+            """
+            INSERT INTO watches (agent_id, task_id)
+            VALUES (?, ?)
+            """,
+            (agent["id"], args.task_id),
+        )
+    except sqlite3.IntegrityError:
+        print_ok(f"{args.agent} already watches task {args.task_id}")
+        return
+    log_event(
+        conn,
+        "watch.added",
+        task_id=args.task_id,
+        agent_id=agent["id"],
+        payload={"task_id": args.task_id},
+    )
+    conn.commit()
+    print_ok(f"{args.agent} now watches task {args.task_id}")
+
+
+def cmd_watch_list(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    params: list[object] = []
+    query = """
+        SELECT
+            w.id,
+            a.name AS agent_name,
+            t.id AS task_id,
+            t.title,
+            w.last_sent_event_id,
+            w.last_ack_event_id,
+            w.last_acknowledged_at,
+            (w.last_sent_event_id - w.last_ack_event_id) AS pending_events
+        FROM watches w
+        JOIN agents a ON a.id = w.agent_id
+        JOIN tasks t ON t.id = w.task_id
+    """
+    if args.agent:
+        agent = get_agent(conn, args.agent)
+        query += " WHERE w.agent_id = ?"
+        params.append(agent["id"])
+    query += " ORDER BY w.id DESC"
+    rows = [dict(row) for row in conn.execute(query, tuple(params)).fetchall()]
+    if args.json:
+        emit_json(rows)
+        return
+    for row in rows:
+        print(
+            f"{row['id']:>3}  {row['agent_name']:<22} task={row['task_id']:<4} "
+            f"pending={row['pending_events']:<4} last_ack={row['last_acknowledged_at'] or '-'}  {row['title']}"
+        )
+
+
+def cmd_watch_ack(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent = get_agent(conn, args.agent)
+    watch = fetch_one(
+        conn,
+        "SELECT * FROM watches WHERE agent_id = ? AND task_id = ?",
+        (agent["id"], args.task_id),
+    )
+    if watch is None:
+        raise SystemExit(f"{args.agent} is not subscribed to task {args.task_id}")
+    ack_event_id = args.event_id if args.event_id is not None else watch["last_sent_event_id"]
+    conn.execute(
+        """
+        UPDATE watches
+        SET last_ack_event_id = ?,
+            last_acknowledged_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (ack_event_id, watch["id"]),
+    )
+    log_event(
+        conn,
+        "watch.acknowledged",
+        task_id=args.task_id,
+        agent_id=agent["id"],
+        payload={"task_id": args.task_id, "ack_event_id": ack_event_id},
+    )
+    conn.commit()
+    print_ok(f"acknowledged subscription delivery for task {args.task_id}")
 
 
 def cmd_msg_task(args: argparse.Namespace) -> None:
@@ -1540,7 +2758,7 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--agent-files", choices=["preserve", "merge", "assisted", "overwrite"], default="merge")
     install_parser.add_argument("--ignore-policy", choices=["none", "runtime", "all"], default="runtime")
     install_parser.add_argument("--ignore-target", choices=["gitignore", "local-exclude"], default="gitignore")
-    install_parser.add_argument("--assisted-agent", choices=["codex", "claude", "manual"], default="codex")
+    install_parser.add_argument("--assisted-agent", choices=["codex", "claude", "gemini", "manual"], default="codex")
     install_parser.add_argument("--non-interactive", action="store_true")
     install_parser.set_defaults(func=cmd_install)
 
@@ -1548,7 +2766,7 @@ def build_parser() -> argparse.ArgumentParser:
     merge_sub = merge_parser.add_subparsers(dest="merge_command", required=True)
 
     merge_plan = merge_sub.add_parser("plan")
-    merge_plan.add_argument("--agent", choices=["codex", "claude", "manual"], default="codex")
+    merge_plan.add_argument("--agent", choices=["codex", "claude", "gemini", "manual"], default="codex")
     merge_plan.set_defaults(func=cmd_merge_plan)
 
     merge_diff = merge_sub.add_parser("diff")
@@ -1561,7 +2779,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_sub = agent_parser.add_subparsers(dest="agent_command", required=True)
 
     agent_identify = agent_sub.add_parser("identify")
-    agent_identify.add_argument("kind", choices=["codex", "claude", "cursor"])
+    agent_identify.add_argument("kind", choices=["codex", "claude", "cursor", "gemini"])
     agent_identify.add_argument("--name")
     agent_identify.add_argument("--role")
     agent_identify.add_argument("--specialty")
@@ -1570,7 +2788,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent_register = agent_sub.add_parser("register")
     agent_register.add_argument("name")
-    agent_register.add_argument("kind", choices=["codex", "claude", "cursor"])
+    agent_register.add_argument("kind", choices=["codex", "claude", "cursor", "gemini"])
     agent_register.add_argument("--role")
     agent_register.add_argument("--specialty")
     agent_register.set_defaults(func=cmd_agent_register)
@@ -1616,10 +2834,74 @@ def build_parser() -> argparse.ArgumentParser:
     session_end.add_argument("session_id", type=int)
     session_end.set_defaults(func=cmd_session_end)
 
+    session_bootstrap_show = session_sub.add_parser("bootstrap-show")
+    session_bootstrap_show.add_argument("session_id", type=int)
+    session_bootstrap_show.add_argument("--json", action="store_true")
+    session_bootstrap_show.set_defaults(func=cmd_session_bootstrap_show)
+
+    session_bootstrap_ack = session_sub.add_parser("bootstrap-ack")
+    session_bootstrap_ack.add_argument("session_id", type=int)
+    session_bootstrap_ack.add_argument("--by", required=True)
+    session_bootstrap_ack.set_defaults(func=cmd_session_bootstrap_ack)
+
+    session_action = session_sub.add_parser("action")
+    session_action.add_argument("session_id", type=int)
+    session_action.add_argument("action_key")
+    session_action.add_argument("--note")
+    session_action.set_defaults(func=cmd_session_action_complete)
+
     session_list = session_sub.add_parser("list")
     session_list.add_argument("--active-only", action="store_true")
     session_list.add_argument("--json", action="store_true")
     session_list.set_defaults(func=cmd_session_list)
+
+    worker_parser = subparsers.add_parser("worker")
+    worker_sub = worker_parser.add_subparsers(dest="worker_command", required=True)
+
+    worker_register = worker_sub.add_parser("register")
+    worker_register.add_argument("name")
+    worker_register.add_argument("kind", choices=["codex", "claude", "cursor", "gemini"])
+    worker_register.add_argument("--role")
+    worker_register.add_argument("--specialty")
+    worker_register.add_argument("--command-json", required=True)
+    worker_register.add_argument("--env-json", default="{}")
+    worker_register.add_argument("--cwd")
+    worker_register.add_argument("--approval-policy", choices=list(VALID_WORKER_APPROVAL_POLICIES), default="always")
+    worker_register.add_argument("--created-by")
+    worker_register.set_defaults(func=cmd_worker_register)
+
+    worker_list = worker_sub.add_parser("list")
+    worker_list.add_argument("--json", action="store_true")
+    worker_list.set_defaults(func=cmd_worker_list)
+
+    worker_runtime_list = worker_sub.add_parser("runtime-list")
+    worker_runtime_list.add_argument("--json", action="store_true")
+    worker_runtime_list.set_defaults(func=cmd_worker_runtime_list)
+
+    worker_request = worker_sub.add_parser("request-start")
+    worker_request.add_argument("worker")
+    worker_request.add_argument("--requested-by", required=True)
+    worker_request.add_argument("--task-id", type=int)
+    worker_request.add_argument("--reason")
+    worker_request.add_argument("--sensitive-action")
+    worker_request.add_argument("--cwd")
+    worker_request.add_argument("--approved-by")
+    worker_request.set_defaults(func=cmd_worker_request_start)
+
+    worker_approve = worker_sub.add_parser("approve")
+    worker_approve.add_argument("runtime_id", type=int)
+    worker_approve.add_argument("decision", choices=["approved", "rejected"])
+    worker_approve.add_argument("--approved-by", required=True)
+    worker_approve.set_defaults(func=cmd_worker_approve)
+
+    worker_start = worker_sub.add_parser("start")
+    worker_start.add_argument("runtime_id", type=int)
+    worker_start.set_defaults(func=cmd_worker_start)
+
+    worker_stop = worker_sub.add_parser("stop")
+    worker_stop.add_argument("runtime_id", type=int)
+    worker_stop.add_argument("--signal", choices=sorted(VALID_RUNTIME_STOP_SIGNALS), default="TERM")
+    worker_stop.set_defaults(func=cmd_worker_stop)
 
     task_parser = subparsers.add_parser("task")
     task_sub = task_parser.add_subparsers(dest="task_command", required=True)
@@ -1633,6 +2915,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_create.add_argument("--parent-task", type=int)
     task_create.add_argument("--delegation-mode", default="direct", choices=["direct", "hypervisor"])
     task_create.add_argument("--path", action="append")
+    task_create.add_argument("--force-role-override", action="store_true")
     task_create.set_defaults(func=cmd_task_create)
 
     task_list = task_sub.add_parser("list")
@@ -1641,6 +2924,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     task_show = task_sub.add_parser("show")
     task_show.add_argument("task_id", type=int)
+    task_show.add_argument("--agent")
     task_show.add_argument("--json", action="store_true")
     task_show.set_defaults(func=cmd_task_show)
 
@@ -1648,12 +2932,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_claim.add_argument("task_id", type=int)
     task_claim.add_argument("agent")
     task_claim.add_argument("--ttl-minutes", type=int, default=30)
+    task_claim.add_argument("--force-role-override", action="store_true")
     task_claim.set_defaults(func=cmd_task_claim)
 
     task_priority = task_sub.add_parser("priority")
     task_priority.add_argument("task_id", type=int)
     task_priority.add_argument("agent")
     task_priority.add_argument("priority", type=int)
+    task_priority.add_argument("--force-role-override", action="store_true")
     task_priority.set_defaults(func=cmd_task_update_priority)
 
     task_delegate = task_sub.add_parser("delegate")
@@ -1668,12 +2954,14 @@ def build_parser() -> argparse.ArgumentParser:
     task_delegate.add_argument("--priority", type=int)
     task_delegate.add_argument("--ttl-minutes", type=int, default=30)
     task_delegate.add_argument("--path", action="append")
+    task_delegate.add_argument("--force-role-override", action="store_true")
     task_delegate.set_defaults(func=cmd_task_delegate)
 
     task_status = task_sub.add_parser("status")
     task_status.add_argument("task_id", type=int)
     task_status.add_argument("agent")
     task_status.add_argument("status")
+    task_status.add_argument("--force-role-override", action="store_true")
     task_status.set_defaults(func=cmd_task_update_status)
 
     task_handoff = task_sub.add_parser("handoff")
@@ -1682,6 +2970,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_handoff.add_argument("to_agent")
     task_handoff.add_argument("--subject")
     task_handoff.add_argument("--body", required=True)
+    task_handoff.add_argument("--force-role-override", action="store_true")
     task_handoff.set_defaults(func=cmd_task_handoff)
 
     lease_parser = subparsers.add_parser("lease")
@@ -1717,6 +3006,78 @@ def build_parser() -> argparse.ArgumentParser:
     msg_task.add_argument("--json", action="store_true")
     add_follow_arguments(msg_task)
     msg_task.set_defaults(func=cmd_msg_task)
+
+    watch_parser = subparsers.add_parser("watch")
+    watch_sub = watch_parser.add_subparsers(dest="watch_command", required=True)
+
+    watch_add = watch_sub.add_parser("add")
+    watch_add.add_argument("agent")
+    watch_add.add_argument("task_id", type=int)
+    watch_add.add_argument("--force-role-override", action="store_true")
+    watch_add.set_defaults(func=cmd_watch_add)
+
+    watch_list = watch_sub.add_parser("list")
+    watch_list.add_argument("--agent")
+    watch_list.add_argument("--json", action="store_true")
+    watch_list.set_defaults(func=cmd_watch_list)
+
+    watch_ack = watch_sub.add_parser("ack")
+    watch_ack.add_argument("agent")
+    watch_ack.add_argument("task_id", type=int)
+    watch_ack.add_argument("--event-id", type=int)
+    watch_ack.set_defaults(func=cmd_watch_ack)
+
+    dispatch_parser = subparsers.add_parser("dispatch")
+    dispatch_sub = dispatch_parser.add_subparsers(dest="dispatch_command", required=True)
+
+    dispatch_create = dispatch_sub.add_parser("create")
+    dispatch_create.add_argument("--task-id", type=int)
+    dispatch_create.add_argument("--from", dest="from_agent", required=True)
+    dispatch_create.add_argument("--to-worker", required=True)
+    dispatch_create.add_argument("--summary", required=True)
+    dispatch_create.add_argument("--body", required=True)
+    dispatch_create.add_argument("--artifact", action="append")
+    dispatch_create.add_argument("--metadata-json", default="{}")
+    dispatch_create.add_argument("--sensitive-action")
+    dispatch_create.add_argument("--require-approval", action="store_true")
+    dispatch_create.add_argument("--approved-by")
+    dispatch_create.set_defaults(func=cmd_dispatch_create)
+
+    dispatch_list = dispatch_sub.add_parser("list")
+    dispatch_list.add_argument("--json", action="store_true")
+    dispatch_list.set_defaults(func=cmd_dispatch_list)
+
+    dispatch_approve = dispatch_sub.add_parser("approve")
+    dispatch_approve.add_argument("packet_id", type=int)
+    dispatch_approve.add_argument("decision", choices=["approved", "rejected"])
+    dispatch_approve.add_argument("--approved-by", required=True)
+    dispatch_approve.set_defaults(func=cmd_dispatch_approve)
+
+    dispatch_send = dispatch_sub.add_parser("send")
+    dispatch_send.add_argument("packet_id", type=int)
+    dispatch_send.add_argument("--runtime-id", type=int)
+    dispatch_send.set_defaults(func=cmd_dispatch_send)
+
+    dispatch_ack = dispatch_sub.add_parser("ack")
+    dispatch_ack.add_argument("packet_id", type=int)
+    dispatch_ack.add_argument("--runtime-id", type=int)
+    dispatch_ack.add_argument("--note")
+    dispatch_ack.set_defaults(func=cmd_dispatch_ack)
+
+    dispatch_complete = dispatch_sub.add_parser("complete")
+    dispatch_complete.add_argument("packet_id", type=int)
+    dispatch_complete.add_argument("status", choices=["completed", "failed", "cancelled"])
+    dispatch_complete.add_argument("--note")
+    dispatch_complete.set_defaults(func=cmd_dispatch_complete)
+
+    prompt_parser = subparsers.add_parser("prompt")
+    prompt_sub = prompt_parser.add_subparsers(dest="prompt_command", required=True)
+
+    prompt_create = prompt_sub.add_parser("create")
+    prompt_create.add_argument("--role", required=True)
+    prompt_create.add_argument("--agent", default=None, help="agent name to hydrate with live state")
+    prompt_create.add_argument("--json", action="store_true")
+    prompt_create.set_defaults(func=cmd_prompt_create)
 
     event_parser = subparsers.add_parser("event")
     event_sub = event_parser.add_subparsers(dest="event_command", required=True)
