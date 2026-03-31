@@ -22,7 +22,6 @@ ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
 CANONICAL_ROLES = {"dev", "pm", "auditor"}
 BUILTIN_SPECIALTIES = ("frontend", "infra", "ux", "security", "release")
 
-
 SCHEMA_STATEMENTS: tuple[str, ...] = (
     """
     PRAGMA journal_mode = WAL;
@@ -31,10 +30,10 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS agents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor')),
         role TEXT NOT NULL DEFAULT '',
         specialty TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'active',
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """,
@@ -43,7 +42,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         agent_id INTEGER NOT NULL,
         label TEXT,
-        status TEXT NOT NULL DEFAULT 'active',
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'ended')),
         cwd TEXT,
         capabilities_json TEXT NOT NULL DEFAULT '{}',
         started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -58,11 +57,11 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         slug TEXT UNIQUE,
         title TEXT NOT NULL,
         description TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'open',
-        priority INTEGER NOT NULL DEFAULT 2,
+        status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending', 'done', 'abandoned')),
+        priority INTEGER NOT NULL DEFAULT 2 CHECK (priority BETWEEN 1 AND 4),
         owner_agent_id INTEGER,
         parent_task_id INTEGER,
-        delegation_mode TEXT NOT NULL DEFAULT 'direct',
+        delegation_mode TEXT NOT NULL DEFAULT 'direct' CHECK (delegation_mode IN ('direct', 'hypervisor')),
         claimed_paths_json TEXT NOT NULL DEFAULT '[]',
         created_by_agent_id INTEGER,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -79,7 +78,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         task_id INTEGER NOT NULL,
         agent_id INTEGER NOT NULL,
         session_id INTEGER,
-        state TEXT NOT NULL DEFAULT 'active',
+        state TEXT NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'released')),
         acquired_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         heartbeat_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         expires_at TEXT NOT NULL,
@@ -94,7 +93,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id INTEGER NOT NULL,
         depends_on_task_id INTEGER NOT NULL,
-        kind TEXT NOT NULL DEFAULT 'blocks',
+        kind TEXT NOT NULL DEFAULT 'blocks' CHECK (kind IN ('blocks')),
         FOREIGN KEY (task_id) REFERENCES tasks(id),
         FOREIGN KEY (depends_on_task_id) REFERENCES tasks(id)
     );
@@ -105,7 +104,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         task_id INTEGER,
         from_agent_id INTEGER NOT NULL,
         to_agent_id INTEGER,
-        type TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('note', 'question', 'answer', 'blocker', 'handoff', 'review_request', 'review_result', 'decision', 'artifact_notice')),
         subject TEXT NOT NULL DEFAULT '',
         body TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -168,6 +167,169 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         UPDATE tasks
         SET updated_at = CURRENT_TIMESTAMP
         WHERE id = OLD.id;
+    END;
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS task_leases_one_active_per_task
+    ON task_leases(task_id)
+    WHERE state = 'active' AND released_at IS NULL;
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS task_dependencies_unique_edge
+    ON task_dependencies(task_id, depends_on_task_id, kind);
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS sessions_validate_insert
+    BEFORE INSERT ON sessions
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid session status')
+        WHERE NEW.status NOT IN ('active', 'ended');
+        SELECT RAISE(ABORT, 'active session cannot have ended_at')
+        WHERE NEW.status = 'active' AND NEW.ended_at IS NOT NULL;
+        SELECT RAISE(ABORT, 'ended session requires ended_at')
+        WHERE NEW.status = 'ended' AND NEW.ended_at IS NULL;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS sessions_validate_update
+    BEFORE UPDATE ON sessions
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid session status')
+        WHERE NEW.status NOT IN ('active', 'ended');
+        SELECT RAISE(ABORT, 'active session cannot have ended_at')
+        WHERE NEW.status = 'active' AND NEW.ended_at IS NOT NULL;
+        SELECT RAISE(ABORT, 'ended session requires ended_at')
+        WHERE NEW.status = 'ended' AND NEW.ended_at IS NULL;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tasks_validate_insert
+    BEFORE INSERT ON tasks
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid task status')
+        WHERE NEW.status NOT IN ('open', 'claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending', 'done', 'abandoned');
+        SELECT RAISE(ABORT, 'invalid task priority')
+        WHERE NEW.priority NOT BETWEEN 1 AND 4;
+        SELECT RAISE(ABORT, 'invalid delegation mode')
+        WHERE NEW.delegation_mode NOT IN ('direct', 'hypervisor');
+        SELECT RAISE(ABORT, 'claimed_paths_json must be a JSON array')
+        WHERE json_valid(NEW.claimed_paths_json) = 0 OR json_type(NEW.claimed_paths_json) != 'array';
+        SELECT RAISE(ABORT, 'active task statuses require an owner')
+        WHERE NEW.status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending')
+          AND NEW.owner_agent_id IS NULL;
+        SELECT RAISE(ABORT, 'done task requires completed_at')
+        WHERE NEW.status = 'done' AND NEW.completed_at IS NULL;
+        SELECT RAISE(ABORT, 'non-done task cannot have completed_at')
+        WHERE NEW.status != 'done' AND NEW.completed_at IS NOT NULL;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS tasks_validate_update
+    BEFORE UPDATE ON tasks
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid task status')
+        WHERE NEW.status NOT IN ('open', 'claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending', 'done', 'abandoned');
+        SELECT RAISE(ABORT, 'invalid task priority')
+        WHERE NEW.priority NOT BETWEEN 1 AND 4;
+        SELECT RAISE(ABORT, 'invalid delegation mode')
+        WHERE NEW.delegation_mode NOT IN ('direct', 'hypervisor');
+        SELECT RAISE(ABORT, 'claimed_paths_json must be a JSON array')
+        WHERE json_valid(NEW.claimed_paths_json) = 0 OR json_type(NEW.claimed_paths_json) != 'array';
+        SELECT RAISE(ABORT, 'active task statuses require an owner')
+        WHERE NEW.status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending')
+          AND NEW.owner_agent_id IS NULL;
+        SELECT RAISE(ABORT, 'done task requires completed_at')
+        WHERE NEW.status = 'done' AND NEW.completed_at IS NULL;
+        SELECT RAISE(ABORT, 'non-done task cannot have completed_at')
+        WHERE NEW.status != 'done' AND NEW.completed_at IS NOT NULL;
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS task_leases_validate_insert
+    BEFORE INSERT ON task_leases
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lease state')
+        WHERE NEW.state NOT IN ('active', 'released');
+        SELECT RAISE(ABORT, 'active lease cannot have released_at')
+        WHERE NEW.state = 'active' AND NEW.released_at IS NOT NULL;
+        SELECT RAISE(ABORT, 'released lease requires released_at')
+        WHERE NEW.state = 'released' AND NEW.released_at IS NULL;
+        SELECT RAISE(ABORT, 'lease session must belong to the same agent')
+        WHERE NEW.session_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sessions s
+              WHERE s.id = NEW.session_id AND s.agent_id = NEW.agent_id
+          );
+        SELECT RAISE(ABORT, 'active lease session must be active')
+        WHERE NEW.state = 'active'
+          AND NEW.session_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sessions s
+              WHERE s.id = NEW.session_id
+                AND s.agent_id = NEW.agent_id
+                AND s.status = 'active'
+                AND s.ended_at IS NULL
+          );
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS task_leases_validate_update
+    BEFORE UPDATE ON task_leases
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'invalid lease state')
+        WHERE NEW.state NOT IN ('active', 'released');
+        SELECT RAISE(ABORT, 'active lease cannot have released_at')
+        WHERE NEW.state = 'active' AND NEW.released_at IS NOT NULL;
+        SELECT RAISE(ABORT, 'released lease requires released_at')
+        WHERE NEW.state = 'released' AND NEW.released_at IS NULL;
+        SELECT RAISE(ABORT, 'lease session must belong to the same agent')
+        WHERE NEW.session_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sessions s
+              WHERE s.id = NEW.session_id AND s.agent_id = NEW.agent_id
+          );
+        SELECT RAISE(ABORT, 'active lease session must be active')
+        WHERE NEW.state = 'active'
+          AND NEW.session_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1
+              FROM sessions s
+              WHERE s.id = NEW.session_id
+                AND s.agent_id = NEW.agent_id
+                AND s.status = 'active'
+                AND s.ended_at IS NULL
+          );
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS task_dependencies_validate_insert
+    BEFORE INSERT ON task_dependencies
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'task cannot depend on itself')
+        WHERE NEW.task_id = NEW.depends_on_task_id;
+        SELECT RAISE(ABORT, 'invalid dependency kind')
+        WHERE NEW.kind NOT IN ('blocks');
+    END;
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS task_dependencies_validate_update
+    BEFORE UPDATE ON task_dependencies
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'task cannot depend on itself')
+        WHERE NEW.task_id = NEW.depends_on_task_id;
+        SELECT RAISE(ABORT, 'invalid dependency kind')
+        WHERE NEW.kind NOT IN ('blocks');
     END;
     """,
 )

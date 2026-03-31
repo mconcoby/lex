@@ -1222,7 +1222,7 @@ def cmd_task_update_status(args: argparse.Namespace) -> None:
         )
     else:
         conn.execute(
-            "UPDATE tasks SET status = ?, owner_agent_id = ? WHERE id = ?",
+            "UPDATE tasks SET status = ?, owner_agent_id = ?, completed_at = NULL WHERE id = ?",
             (args.status, agent["id"], args.task_id),
         )
     log_event(

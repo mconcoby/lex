@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from lex.cli import main
 from lex.db import connect, ensure_workspace, initialize_database
 
@@ -127,3 +131,81 @@ def test_task_priority_command_updates_priority(tmp_path):
     ).fetchone()
     assert task["priority"] == 1
     assert event["event_type"] == "task.priority_changed"
+
+
+def test_database_rejects_duplicate_active_leases_for_task(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_agents(conn)
+    codex_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("codex-brisk-otter",)).fetchone()["id"]
+    claude_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("claude-steady-ibis",)).fetchone()["id"]
+    conn.execute(
+        "INSERT INTO tasks (title, status, owner_agent_id) VALUES ('Lease me', 'claimed', ?)",
+        (codex_id,),
+    )
+    task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO task_leases (task_id, agent_id, expires_at) VALUES (?, ?, datetime('now', '+30 minutes'))",
+        (task_id, codex_id),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed: task_leases.task_id"):
+        conn.execute(
+            "INSERT INTO task_leases (task_id, agent_id, expires_at) VALUES (?, ?, datetime('now', '+30 minutes'))",
+            (task_id, claude_id),
+        )
+
+
+def test_database_rejects_lease_bound_to_another_agents_session(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_agents(conn)
+    codex_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("codex-brisk-otter",)).fetchone()["id"]
+    claude_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("claude-steady-ibis",)).fetchone()["id"]
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, cwd, capabilities_json)
+        VALUES (?, 'primary', 'active', ?, '{}')
+        """,
+        (codex_id, str(tmp_path)),
+    )
+    session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO tasks (title, status, owner_agent_id) VALUES ('Session bound task', 'claimed', ?)",
+        (claude_id,),
+    )
+    task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    with pytest.raises(sqlite3.IntegrityError, match="lease session must belong to the same agent"):
+        conn.execute(
+            """
+            INSERT INTO task_leases (task_id, agent_id, session_id, expires_at)
+            VALUES (?, ?, ?, datetime('now', '+30 minutes'))
+            """,
+            (task_id, claude_id, session_id),
+        )
+
+
+def test_database_rejects_done_task_without_completed_at(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_agents(conn)
+    codex_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("codex-brisk-otter",)).fetchone()["id"]
+
+    with pytest.raises(sqlite3.IntegrityError, match="done task requires completed_at"):
+        conn.execute(
+            "INSERT INTO tasks (title, status, owner_agent_id) VALUES ('Incomplete done task', 'done', ?)",
+            (codex_id,),
+        )
+
+
+def test_database_rejects_non_done_task_with_completed_at(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_agents(conn)
+    codex_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("codex-brisk-otter",)).fetchone()["id"]
+
+    with pytest.raises(sqlite3.IntegrityError, match="non-done task cannot have completed_at"):
+        conn.execute(
+            """
+            INSERT INTO tasks (title, status, owner_agent_id, completed_at)
+            VALUES ('Premature completion', 'claimed', ?, CURRENT_TIMESTAMP)
+            """,
+            (codex_id,),
+        )
