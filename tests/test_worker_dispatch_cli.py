@@ -248,3 +248,79 @@ def test_dispatch_packet_lifecycle_writes_worker_inbox(tmp_path):
     assert payload["packet"]["summary"] == "Implement worker inbox read"
     assert payload["packet"]["artifacts"] == ["docs/spec.md"]
     assert payload["packet"]["metadata"]["priority"] == "p1"
+
+
+def test_worker_cleanup_marks_stale_runtime_failed(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_pm_agent(conn)
+    conn.execute(
+        """
+        INSERT INTO worker_definitions (name, kind, role, specialty, command_json, approval_policy, created_by_agent_id)
+        VALUES ('codex-dispatch-dev', 'codex', 'dev', '', '[]', 'never', 1)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO worker_runtimes (
+            worker_id, task_id, requested_by_agent_id, reason, approval_required,
+            approval_status, status, started_at, heartbeat_at
+        )
+        VALUES (1, NULL, 1, 'stale runtime', 0, 'not_required', 'running', CURRENT_TIMESTAMP, datetime('now', '-10 minutes'))
+        """
+    )
+    conn.commit()
+
+    main(["--root", str(tmp_path), "worker", "cleanup", "--stale-minutes", "1"])
+
+    runtime = conn.execute("SELECT status, ended_at FROM worker_runtimes WHERE id = 1").fetchone()
+    event = conn.execute(
+        "SELECT event_type FROM events WHERE event_type = 'worker.runtime_failed' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    assert runtime["status"] == "failed"
+    assert runtime["ended_at"] is not None
+    assert event["event_type"] == "worker.runtime_failed"
+
+
+def test_worker_cleanup_fails_delivered_packets_for_stale_runtime(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_pm_agent(conn)
+    conn.execute("INSERT INTO tasks (title, status, priority, owner_agent_id, delegation_mode) VALUES ('Dispatch task', 'claimed', 2, 1, 'direct')")
+    conn.execute(
+        """
+        INSERT INTO worker_definitions (name, kind, role, specialty, command_json, approval_policy, created_by_agent_id)
+        VALUES ('codex-dispatch-dev', 'codex', 'dev', '', '[]', 'never', 1)
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO worker_runtimes (
+            worker_id, task_id, requested_by_agent_id, reason, approval_required,
+            approval_status, status, started_at, heartbeat_at
+        )
+        VALUES (1, 1, 1, 'stale runtime', 0, 'not_required', 'running', CURRENT_TIMESTAMP, datetime('now', '-10 minutes'))
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO dispatch_packets (
+            task_id, runtime_id, to_worker_id, from_agent_id, packet_json, approval_status, delivery_status, delivered_at
+        )
+        VALUES (1, 1, 1, 1, '{}', 'approved', 'delivered', CURRENT_TIMESTAMP)
+        """
+    )
+    conn.commit()
+
+    main(["--root", str(tmp_path), "worker", "cleanup", "--stale-minutes", "1"])
+
+    packet = conn.execute(
+        "SELECT delivery_status, completed_at, completion_note FROM dispatch_packets WHERE id = 1"
+    ).fetchone()
+    event = conn.execute(
+        "SELECT event_type FROM events WHERE event_type = 'dispatch.packet_completed' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    assert packet["delivery_status"] == "failed"
+    assert packet["completed_at"] is not None
+    assert "stale heartbeat" in packet["completion_note"]
+    assert event["event_type"] == "dispatch.packet_completed"

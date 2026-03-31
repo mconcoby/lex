@@ -201,6 +201,7 @@ python3 -m lex.cli worker request-start codex-dev \
 python3 -m lex.cli worker approve 1 approved --approved-by human
 python3 -m lex.cli worker start 1
 python3 -m lex.cli worker runtime-list
+python3 -m lex.cli worker cleanup
 ```
 
 Worker runtimes expose:

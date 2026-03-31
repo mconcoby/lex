@@ -22,6 +22,10 @@ ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
 CANONICAL_ROLES = {"dev", "pm", "auditor", "infra"}
 BUILTIN_SPECIALTIES = ("frontend", "infra", "ux", "security", "release")
 VALID_AGENT_KINDS = ("codex", "claude", "cursor", "gemini")
+# agents.status is intentionally restricted to 'active' only.
+# Lex does not soft-delete agents; stale agent records are reconciled by the PM
+# (removed or merged) rather than deactivated. If agent lifecycle states are
+# needed in the future, add 'inactive'/'retired' here and update the constraint.
 VALID_AGENT_STATUSES = ("active",)
 VALID_SESSION_STATUSES = ("active", "ended")
 VALID_WORKER_APPROVAL_POLICIES = ("always", "on_sensitive", "never")
@@ -347,6 +351,9 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE INDEX IF NOT EXISTS dispatch_packets_by_status
     ON dispatch_packets(delivery_status, id DESC);
     """,
+    # sessions_validate_insert / sessions_validate_update are intentionally
+    # identical in logic. SQLite does not support BEFORE INSERT OR UPDATE syntax,
+    # so both triggers must be declared separately.
     """
     CREATE TRIGGER IF NOT EXISTS sessions_validate_insert
     BEFORE INSERT ON sessions
@@ -373,6 +380,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         WHERE NEW.status = 'ended' AND NEW.ended_at IS NULL;
     END;
     """,
+    # tasks_validate_insert / tasks_validate_update are intentionally identical.
+    # SQLite requires separate triggers for INSERT and UPDATE.
     """
     CREATE TRIGGER IF NOT EXISTS tasks_validate_insert
     BEFORE INSERT ON tasks
@@ -417,6 +426,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         WHERE NEW.status != 'done' AND NEW.completed_at IS NOT NULL;
     END;
     """,
+    # task_leases_validate_insert / task_leases_validate_update are intentionally
+    # identical. SQLite requires separate triggers for INSERT and UPDATE.
     """
     CREATE TRIGGER IF NOT EXISTS task_leases_validate_insert
     BEFORE INSERT ON task_leases
@@ -479,6 +490,8 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
           );
     END;
     """,
+    # task_dependencies_validate_insert / task_dependencies_validate_update are
+    # intentionally identical. SQLite requires separate triggers for INSERT and UPDATE.
     """
     CREATE TRIGGER IF NOT EXISTS task_dependencies_validate_insert
     BEFORE INSERT ON task_dependencies
@@ -509,6 +522,11 @@ SESSION_REQUIRED_COLUMNS: dict[str, str] = {
     "heartbeat_at": "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP",
     "fingerprint": "TEXT",
     "fingerprint_label": "TEXT",
+    "git_branch": "TEXT",
+    "git_base_ref": "TEXT",
+    "git_dirty": "INTEGER",
+    "git_staged_files_json": "TEXT",
+    "git_changed_files_json": "TEXT",
 }
 AGENT_REQUIRED_COLUMNS: dict[str, str] = {
     "role": "TEXT NOT NULL DEFAULT ''",
@@ -654,6 +672,86 @@ def log_event(
             """,
             (event_id, event_id, task_id),
         )
+
+
+def _normalize_path(p: str) -> tuple[str, ...]:
+    """Return path components after resolving . and .. and stripping trailing slashes."""
+    return tuple(Path(p.rstrip("/")).parts)
+
+
+def _paths_overlap(a: tuple[str, ...], b: tuple[str, ...]) -> bool:
+    """True when one path is an ancestor of (or identical to) the other.
+
+    Uses component-wise prefix comparison to avoid false matches between
+    siblings like src/foo and src/foobar.
+    """
+    min_len = min(len(a), len(b))
+    if min_len == 0:
+        return False
+    return a[:min_len] == b[:min_len]
+
+
+def detect_path_conflicts(
+    conn: sqlite3.Connection,
+    candidate_paths: list[str],
+    exclude_task_id: int | None = None,
+    claiming_branch: str | None = None,
+) -> list[dict]:
+    """Return conflict records for active tasks whose claimed paths overlap with candidate_paths.
+
+    Each record contains task_id, owner_agent_name, conflicting_path, candidate_path,
+    owner_git_branch, and cross_branch. cross_branch is True when both the claiming
+    session and the conflicting owner's latest active session have known but different
+    branches — these conflicts should be downgraded from hard blocks to warnings.
+
+    Returns an empty list when candidate_paths is empty or no conflicts exist.
+    """
+    if not candidate_paths:
+        return []
+
+    candidate_norm = [(p, _normalize_path(p)) for p in candidate_paths]
+
+    rows = conn.execute(
+        """
+        SELECT t.id, t.claimed_paths_json, a.name AS owner_agent_name,
+               (SELECT s.git_branch FROM sessions s
+                WHERE s.agent_id = a.id AND s.status = 'active' AND s.ended_at IS NULL
+                ORDER BY s.id DESC LIMIT 1) AS owner_git_branch
+        FROM tasks t
+        JOIN agents a ON a.id = t.owner_agent_id
+        JOIN task_leases tl ON tl.task_id = t.id
+        WHERE t.status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending')
+          AND tl.state = 'active'
+          AND tl.released_at IS NULL
+          AND tl.expires_at > CURRENT_TIMESTAMP
+          AND t.id != ?
+        """,
+        (exclude_task_id if exclude_task_id is not None else -1,),
+    ).fetchall()
+
+    conflicts = []
+    for row in rows:
+        other_paths = json.loads(row["claimed_paths_json"])
+        owner_branch = row["owner_git_branch"]
+        cross_branch = (
+            claiming_branch is not None
+            and owner_branch is not None
+            and claiming_branch != owner_branch
+        )
+        for other_raw in other_paths:
+            other_norm = _normalize_path(other_raw)
+            for cand_raw, cand_norm in candidate_norm:
+                if _paths_overlap(cand_norm, other_norm):
+                    conflicts.append({
+                        "task_id": row["id"],
+                        "owner_agent_name": row["owner_agent_name"],
+                        "conflicting_path": other_raw,
+                        "candidate_path": cand_raw,
+                        "owner_git_branch": owner_branch,
+                        "cross_branch": cross_branch,
+                    })
+
+    return conflicts
 
 
 def ensure_workspace(root: str | Path | None = None) -> LexPaths:

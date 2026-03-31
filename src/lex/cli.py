@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from lex.db import BUILTIN_SPECIALTIES, connect, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths
+from lex.db import BUILTIN_SPECIALTIES, connect, detect_path_conflicts, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
     command_preview,
@@ -92,6 +92,7 @@ VALID_MESSAGE_TYPES = {
     "artifact_notice",
 }
 SESSION_STALE_MINUTES = 15
+WORKER_RUNTIME_STALE_MINUTES = 2
 VALID_RUNTIME_APPROVAL_STATUSES = {"pending_approval", "approved", "rejected", "not_required"}
 VALID_RUNTIME_STOP_SIGNALS = {"TERM": signal.SIGTERM, "KILL": signal.SIGKILL, "INT": signal.SIGINT}
 VALID_PACKET_APPROVAL_STATUSES = {"pending_approval", "approved", "rejected", "not_required"}
@@ -612,6 +613,167 @@ def release_stale_leases(conn: sqlite3.Connection) -> int:
             payload={"reason": "stale_session"},
         )
     return len(stale_leases)
+
+
+def _process_is_alive(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def cleanup_stale_worker_runtimes(
+    conn: sqlite3.Connection,
+    *,
+    stale_minutes: int = WORKER_RUNTIME_STALE_MINUTES,
+) -> list[dict[str, object]]:
+    stale_runtimes = conn.execute(
+        """
+        SELECT
+            wr.id,
+            wr.task_id,
+            wr.requested_by_agent_id,
+            wr.status,
+            wr.pid,
+            wr.supervisor_pid,
+            wr.child_pid,
+            wd.name AS worker_name
+        FROM worker_runtimes wr
+        JOIN worker_definitions wd ON wd.id = wr.worker_id
+        WHERE wr.status IN ('launching', 'running')
+          AND wr.heartbeat_at < datetime('now', ?)
+        ORDER BY wr.id ASC
+        """,
+        (f"-{stale_minutes} minutes",),
+    ).fetchall()
+    cleaned: list[dict[str, object]] = []
+    for runtime in stale_runtimes:
+        pid_candidates = []
+        for pid in (runtime["child_pid"], runtime["pid"], runtime["supervisor_pid"]):
+            if pid and pid not in pid_candidates:
+                pid_candidates.append(pid)
+        live_pids = [pid for pid in pid_candidates if _process_is_alive(pid)]
+        if live_pids:
+            continue
+        conn.execute(
+            """
+            UPDATE worker_runtimes
+            SET status = 'failed',
+                ended_at = COALESCE(ended_at, CURRENT_TIMESTAMP)
+            WHERE id = ?
+            """,
+            (runtime["id"],),
+        )
+        blocked_packets = conn.execute(
+            """
+            SELECT id, task_id
+            FROM dispatch_packets
+            WHERE runtime_id = ?
+              AND delivery_status IN ('delivered', 'acknowledged')
+            ORDER BY id ASC
+            """,
+            (runtime["id"],),
+        ).fetchall()
+        conn.execute(
+            """
+            UPDATE dispatch_packets
+            SET delivery_status = 'failed',
+                completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+                completion_note = ?
+            WHERE runtime_id = ?
+              AND delivery_status IN ('delivered', 'acknowledged')
+            """,
+            (f"runtime {runtime['id']} failed after stale heartbeat", runtime["id"]),
+        )
+        log_event(
+            conn,
+            "worker.runtime_failed",
+            task_id=runtime["task_id"],
+            agent_id=runtime["requested_by_agent_id"],
+            payload={
+                "runtime_id": runtime["id"],
+                "worker_name": runtime["worker_name"],
+                "reason": "stale_heartbeat",
+                "stale_minutes": stale_minutes,
+            },
+        )
+        for packet in blocked_packets:
+            log_event(
+                conn,
+                "dispatch.packet_completed",
+                task_id=packet["task_id"],
+                agent_id=runtime["requested_by_agent_id"],
+                payload={
+                    "packet_id": packet["id"],
+                    "status": "failed",
+                    "note": f"runtime {runtime['id']} failed after stale heartbeat",
+                },
+            )
+        cleaned.append(
+            {
+                "runtime_id": runtime["id"],
+                "worker_name": runtime["worker_name"],
+                "stale_minutes": stale_minutes,
+                "packet_count": len(blocked_packets),
+            }
+        )
+    return cleaned
+
+
+def capture_git_snapshot(cwd: str | None = None) -> dict:
+    """Run git commands in cwd and return session git fields.
+
+    All fields are None when git is unavailable or cwd is not inside a git repo.
+    This is best-effort and must never raise — failures return a null snapshot.
+    """
+    import subprocess
+
+    null_snapshot: dict = {
+        "git_branch": None,
+        "git_base_ref": None,
+        "git_dirty": None,
+        "git_staged_files_json": None,
+        "git_changed_files_json": None,
+    }
+
+    cwd_path = Path(cwd) if cwd else Path.cwd()
+
+    def run(cmd: list[str]) -> str | None:
+        try:
+            return subprocess.check_output(cmd, cwd=cwd_path, stderr=subprocess.DEVNULL, text=True).strip()
+        except Exception:
+            return None
+
+    branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    if not branch or branch == "HEAD":
+        return null_snapshot
+
+    staged_out = run(["git", "diff", "--name-only", "--cached"]) or ""
+    dirty_out = run(["git", "diff", "--name-only"]) or ""
+
+    base_ref: str | None = None
+    for remote_ref in ("origin/main", "origin/master"):
+        base_ref = run(["git", "merge-base", "HEAD", remote_ref])
+        if base_ref:
+            break
+
+    changed_files: list[str] = []
+    if base_ref:
+        changed_out = run(["git", "diff", "--name-only", f"{base_ref}...HEAD"]) or ""
+        changed_files = [f for f in changed_out.splitlines() if f]
+
+    return {
+        "git_branch": branch,
+        "git_base_ref": base_ref,
+        "git_dirty": 1 if dirty_out.strip() else 0,
+        "git_staged_files_json": json.dumps([f for f in staged_out.splitlines() if f]),
+        "git_changed_files_json": json.dumps(changed_files),
+    }
 
 
 def build_session_fingerprint(*, kind: str, cwd: str) -> tuple[str, str]:
@@ -1179,10 +1341,14 @@ def cmd_session_start(args: argparse.Namespace) -> None:
         """,
         (agent["id"], fingerprint),
     ).fetchall()
+    git = capture_git_snapshot(args.cwd)
     conn.execute(
         """
-        INSERT INTO sessions (agent_id, label, fingerprint, fingerprint_label, status, cwd, capabilities_json)
-        VALUES (?, ?, ?, ?, 'active', ?, ?)
+        INSERT INTO sessions (
+            agent_id, label, fingerprint, fingerprint_label, status, cwd, capabilities_json,
+            git_branch, git_base_ref, git_dirty, git_staged_files_json, git_changed_files_json
+        )
+        VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             agent["id"],
@@ -1191,6 +1357,11 @@ def cmd_session_start(args: argparse.Namespace) -> None:
             fingerprint_label,
             args.cwd,
             json.dumps({"capabilities": args.capability or []}),
+            git["git_branch"],
+            git["git_base_ref"],
+            git["git_dirty"],
+            git["git_staged_files_json"],
+            git["git_changed_files_json"],
         ),
     )
     session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
@@ -1199,7 +1370,13 @@ def cmd_session_start(args: argparse.Namespace) -> None:
         "session.started",
         agent_id=agent["id"],
         session_id=session_id,
-        payload={"label": args.label, "cwd": args.cwd, "fingerprint": fingerprint, "fingerprint_label": fingerprint_label},
+        payload={
+            "label": args.label,
+            "cwd": args.cwd,
+            "fingerprint": fingerprint,
+            "fingerprint_label": fingerprint_label,
+            "git_branch": git["git_branch"],
+        },
     )
     create_session_bootstrap(conn, session_id=session_id, agent=agent)
     conn.commit()
@@ -1405,20 +1582,23 @@ def cmd_session_heartbeat(args: argparse.Namespace) -> None:
     conn = connect(paths.db_path)
     initialize_database(conn)
     session = get_session(conn, args.session_id)
+    git = capture_git_snapshot(session["cwd"])
     conn.execute(
         """
         UPDATE sessions
-        SET heartbeat_at = CURRENT_TIMESTAMP
+        SET heartbeat_at = CURRENT_TIMESTAMP,
+            git_dirty = ?,
+            git_staged_files_json = ?
         WHERE id = ? AND status = 'active' AND ended_at IS NULL
         """,
-        (args.session_id,),
+        (git["git_dirty"], git["git_staged_files_json"], args.session_id),
     )
     log_event(
         conn,
         "session.heartbeat",
         agent_id=session["agent_id"],
         session_id=args.session_id,
-        payload={"label": session["label"]},
+        payload={"label": session["label"], "git_branch": session["git_branch"]},
     )
     conn.commit()
     print_ok(f"heartbeat recorded for session {args.session_id}")
@@ -1735,6 +1915,42 @@ def cmd_task_claim(args: argparse.Namespace) -> None:
     )
     if active_lease is not None and active_lease["agent_id"] != agent["id"]:
         raise SystemExit(f"task {args.task_id} is already leased by another agent")
+    candidate_paths = json.loads(task["claimed_paths_json"])
+    claiming_branch = session["git_branch"] if session else None
+    conflicts = detect_path_conflicts(
+        conn, candidate_paths, exclude_task_id=args.task_id, claiming_branch=claiming_branch
+    )
+    for conflict in conflicts:
+        log_event(
+            conn,
+            "task.conflict_detected",
+            task_id=args.task_id,
+            agent_id=agent["id"],
+            payload={
+                "conflicting_task_id": conflict["task_id"],
+                "owner_agent_name": conflict["owner_agent_name"],
+                "conflicting_path": conflict["conflicting_path"],
+                "candidate_path": conflict["candidate_path"],
+                "cross_branch": conflict["cross_branch"],
+            },
+        )
+    # --strict blocks only same-branch (or branch-unknown) conflicts; cross-branch
+    # conflicts are always downgraded to warnings per the conflict model.
+    hard_conflicts = [c for c in conflicts if not c["cross_branch"]]
+    if hard_conflicts and args.strict:
+        owners = ", ".join(
+            f"task {c['task_id']} ({c['owner_agent_name']}) @ {c['conflicting_path']}"
+            for c in hard_conflicts
+        )
+        conn.commit()
+        raise SystemExit(f"path conflict detected — blocked by: {owners}")
+    if conflicts:
+        for c in conflicts:
+            branch_note = f" [cross-branch: {claiming_branch} vs {c['owner_git_branch']}]" if c["cross_branch"] else ""
+            print(
+                f"warning: path conflict with task {c['task_id']} "
+                f"({c['owner_agent_name']}) — {c['candidate_path']} overlaps {c['conflicting_path']}{branch_note}"
+            )
     if active_lease is None:
         conn.execute(
             """
@@ -2129,6 +2345,8 @@ def cmd_worker_runtime_list(args: argparse.Namespace) -> None:
     paths = resolve_paths(args.root)
     conn = connect(paths.db_path)
     initialize_database(conn)
+    cleanup_stale_worker_runtimes(conn)
+    conn.commit()
     rows = conn.execute(
         """
         SELECT
@@ -2162,6 +2380,25 @@ def cmd_worker_runtime_list(args: argparse.Namespace) -> None:
             f"{row['id']:>3}  {row['worker_name']:<24} {row['status']:<16} "
             f"approval={row['approval_status']:<16} task={row['task_id'] or '-':<4} "
             f"requested_by={row['requested_by_name'] or '-':<20} pid={row['child_pid'] or row['pid'] or '-'}"
+        )
+
+
+def cmd_worker_cleanup(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    cleaned = cleanup_stale_worker_runtimes(conn, stale_minutes=args.stale_minutes)
+    conn.commit()
+    if args.json:
+        emit_json(cleaned)
+        return
+    if not cleaned:
+        print_info("no stale worker runtimes found")
+        return
+    for row in cleaned:
+        print(
+            f"{row['runtime_id']:>3}  {row['worker_name']:<24} failed  "
+            f"stale={row['stale_minutes']}m packets={row['packet_count']}"
         )
 
 
@@ -2284,6 +2521,7 @@ def cmd_dispatch_send(args: argparse.Namespace) -> None:
     paths = resolve_paths(args.root)
     conn = connect(paths.db_path)
     initialize_database(conn)
+    cleanup_stale_worker_runtimes(conn)
     packet = get_dispatch_packet(conn, args.packet_id)
     if packet["requires_human_approval"] and packet["approval_status"] != "approved":
         raise SystemExit("dispatch packet requires human approval before delivery")
@@ -2878,6 +3116,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker_runtime_list.add_argument("--json", action="store_true")
     worker_runtime_list.set_defaults(func=cmd_worker_runtime_list)
 
+    worker_cleanup = worker_sub.add_parser("cleanup")
+    worker_cleanup.add_argument("--stale-minutes", type=int, default=WORKER_RUNTIME_STALE_MINUTES)
+    worker_cleanup.add_argument("--json", action="store_true")
+    worker_cleanup.set_defaults(func=cmd_worker_cleanup)
+
     worker_request = worker_sub.add_parser("request-start")
     worker_request.add_argument("worker")
     worker_request.add_argument("--requested-by", required=True)
@@ -2933,6 +3176,7 @@ def build_parser() -> argparse.ArgumentParser:
     task_claim.add_argument("agent")
     task_claim.add_argument("--ttl-minutes", type=int, default=30)
     task_claim.add_argument("--force-role-override", action="store_true")
+    task_claim.add_argument("--strict", action="store_true", help="block claim on path conflict instead of warning")
     task_claim.set_defaults(func=cmd_task_claim)
 
     task_priority = task_sub.add_parser("priority")
