@@ -15,7 +15,7 @@ class MergePaths:
 
 
 def resolve_merge_paths(root: Path) -> MergePaths:
-    rex_runtime = root / ".rex" / "runtime"
+    rex_runtime = root / ".lex" / "runtime"
     return MergePaths(
         root=root,
         rex_runtime=rex_runtime,
@@ -48,27 +48,27 @@ Preferred merge assistant: `{agent_kind}`
 
 ## Objective
 
-Integrate `rex` into existing root agent files without erasing project-specific behavior.
+Integrate `lex` into existing root agent files without erasing project-specific behavior.
 
 ## Hard Constraints
 
 - Preserve any existing router system unless it is clearly redundant
 - Preserve explicit role splits such as PM, Dev, reviewer, or routing agents
-- Add `rex` as a coordination substrate, not a replacement for project-specific instructions
+- Add `lex` as a coordination substrate, not a replacement for project-specific instructions
 - Prefer small integration sections over full rewrites
 - If conflicts are structural, propose options instead of forcing a merge
 
 ## Inputs
 
-- Existing root agent files copied into `.rex/runtime/install-merge-context/`
-- Canonical rex bridge references copied into the same context directory
+- Existing root agent files copied into `.lex/runtime/install-merge-context/`
+- Canonical lex bridge references copied into the same context directory
 
 ## Expected Proposal
 
 Write proposed merged root files to:
 
-- `.rex/runtime/install-merge-proposal/AGENTS.md`
-- `.rex/runtime/install-merge-proposal/CLAUDE.md`
+- `.lex/runtime/install-merge-proposal/AGENTS.md`
+- `.lex/runtime/install-merge-proposal/CLAUDE.md`
 
 If one file does not need changes, still write a proposal file that explains why the original should remain effectively unchanged.
 """
@@ -76,8 +76,8 @@ If one file does not need changes, still write a proposal file that explains why
 
 def build_bridge_reference(agent_kind: str) -> str:
     if agent_kind == "codex":
-        return "Read `.rex/adapters/codex/AGENTS.md` before starting work.\n"
-    return "Read `.rex/adapters/claude/CLAUDE.md` before starting work.\n"
+        return "Read `.lex/adapters/codex/AGENTS.md` before starting work.\n"
+    return "Read `.lex/adapters/claude/CLAUDE.md` before starting work.\n"
 
 
 def create_merge_packet(root: Path, *, agent_kind: str) -> MergePaths:
@@ -90,8 +90,8 @@ def create_merge_packet(root: Path, *, agent_kind: str) -> MergePaths:
     claude_root = root / "CLAUDE.md"
     write_text(paths.context_dir / "AGENTS.original.md", read_text(agents_root))
     write_text(paths.context_dir / "CLAUDE.original.md", read_text(claude_root))
-    write_text(paths.context_dir / "rex-codex-bridge.md", build_bridge_reference("codex"))
-    write_text(paths.context_dir / "rex-claude-bridge.md", build_bridge_reference("claude"))
+    write_text(paths.context_dir / "lex-codex-bridge.md", build_bridge_reference("codex"))
+    write_text(paths.context_dir / "lex-claude-bridge.md", build_bridge_reference("claude"))
 
     if not (paths.proposal_dir / "AGENTS.md").exists():
         write_text(

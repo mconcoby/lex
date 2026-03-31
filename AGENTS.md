@@ -1,3 +1,3 @@
 # Codex Bridge
 
-Read `.rex/adapters/codex/AGENTS.md`.
+Read `.lex/adapters/codex/AGENTS.md`.

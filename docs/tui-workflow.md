@@ -1,12 +1,12 @@
-# rex TUI Workflow
+# lex TUI Workflow
 
 The preferred entrypoint for day-to-day use is:
 
 ```bash
-python3 -m rex.cli
+python3 -m lex.cli
 ```
 
-When a real terminal is available, this launches the rex TUI. Otherwise rex falls back to the simpler menu shell.
+When a real terminal is available, this launches the lex TUI. Otherwise lex falls back to the simpler menu shell.
 
 ## Core Navigation
 
@@ -45,11 +45,11 @@ The selected-task pane shows:
 
 ## Usage Notes
 
-- The TUI operates on the same `.rex/rex.db` state as the CLI commands.
-- If another agent is active in the same repository, use rex task ownership and session state before making overlapping changes.
+- The TUI operates on the same `.lex/lex.db` state as the CLI commands.
+- If another agent is active in the same repository, use lex task ownership and session state before making overlapping changes.
 - For complex root-agent-file integration, use the assisted merge workflow outside the TUI:
 
 ```bash
-python3 -m rex.cli merge diff
-python3 -m rex.cli merge apply
+python3 -m lex.cli merge diff
+python3 -m lex.cli merge apply
 ```

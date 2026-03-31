@@ -1,3 +1,3 @@
 # Claude Bridge
 
-Read `.rex/adapters/claude/CLAUDE.md`.
+Read `.lex/adapters/claude/CLAUDE.md`.

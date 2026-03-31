@@ -3,7 +3,7 @@ from __future__ import annotations
 import curses
 from pathlib import Path
 
-from rex.dashboard import DashboardState, load_dashboard_state
+from lex.dashboard import DashboardState, load_dashboard_state
 
 
 # ── color pair IDs ─────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ class RexTui:
         header_attr = self._cp(_C_STATUS_BAR)
         stdscr.attron(header_attr)
         stdscr.hline(0, 0, " ", width)
-        root_str = f" rex  {self.root} "
+        root_str = f" lex  {self.root} "
         summary = (
             f"  agents={len(self.state.agents)}"
             f"  sessions={len(self.state.sessions)}"
@@ -397,7 +397,7 @@ class RexTui:
             self.selected_session = min(max(self.selected_session + delta, 0), max(len(self.state.sessions) - 1, 0))
 
     def _create_task(self, stdscr) -> None:
-        from rex.cli import cmd_task_create
+        from lex.cli import cmd_task_create
 
         title = self._prompt(stdscr, "task title")
         if not title:
@@ -419,7 +419,7 @@ class RexTui:
         self.status = f"✔ created task: {title}"
 
     def _claim_task(self, stdscr) -> None:
-        from rex.cli import cmd_task_claim
+        from lex.cli import cmd_task_claim
 
         if not self.state.tasks:
             self.status = "no tasks to claim"
@@ -441,7 +441,7 @@ class RexTui:
         self.status = f"✔ claimed task {task['id']} for {agent}"
 
     def _start_session(self, stdscr) -> None:
-        from rex.cli import cmd_session_start
+        from lex.cli import cmd_session_start
 
         default_agent = self.state.agents[0]["name"] if self.state.agents else ""
         agent = self._prompt_with_default(stdscr, "agent name", default_agent)
@@ -461,7 +461,7 @@ class RexTui:
         self.status = f"✔ started session for {agent}"
 
     def _register_agent(self, stdscr) -> None:
-        from rex.cli import cmd_agent_identify, cmd_agent_register
+        from lex.cli import cmd_agent_identify, cmd_agent_register
 
         kind = self._prompt_choice(stdscr, "agent kind", ["codex", "claude", "cursor"], "codex")
         role = self._prompt_choice(stdscr, "agent role", ["dev", "pm", "auditor"], "dev")
@@ -492,7 +492,7 @@ class RexTui:
         self.status = f"✔ identified new {kind} agent"
 
     def _heartbeat_session(self, stdscr) -> None:
-        from rex.cli import cmd_session_heartbeat
+        from lex.cli import cmd_session_heartbeat
 
         if not self.state.sessions:
             self.status = "no active sessions"
@@ -502,7 +502,7 @@ class RexTui:
         self.status = f"✔ heartbeat for session {session_id}"
 
     def _end_session(self, stdscr) -> None:
-        from rex.cli import cmd_session_end
+        from lex.cli import cmd_session_end
 
         if not self.state.sessions:
             self.status = "no active sessions"
@@ -512,7 +512,7 @@ class RexTui:
         self.status = f"✔ ended session {session_id}"
 
     def _send_message(self, stdscr) -> None:
-        from rex.cli import cmd_msg_send
+        from lex.cli import cmd_msg_send
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -549,7 +549,7 @@ class RexTui:
         self.status = f"✔ sent {message_type} on task {task['id']}"
 
     def _update_status(self, stdscr) -> None:
-        from rex.cli import cmd_task_update_status
+        from lex.cli import cmd_task_update_status
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -578,7 +578,7 @@ class RexTui:
         self.status = f"✔ task {task['id']} → {status}"
 
     def _delegate_task(self, stdscr) -> None:
-        from rex.cli import cmd_task_delegate
+        from lex.cli import cmd_task_delegate
 
         if not self.state.tasks:
             self.status = "no task selected"
@@ -610,7 +610,7 @@ class RexTui:
         self.status = f"✔ delegated child task from #{task['id']} to {assignee}"
 
     def _handoff_task(self, stdscr) -> None:
-        from rex.cli import cmd_task_handoff
+        from lex.cli import cmd_task_handoff
 
         if not self.state.tasks:
             self.status = "no task selected"

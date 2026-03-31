@@ -1,10 +1,10 @@
 from argparse import Namespace
 
-from rex.cli import AGENT_NAME_RE, allocate_agent_name, build_session_fingerprint, cmd_agent_identify, normalize_agent_role, resolve_install_options
-from rex.dashboard import load_dashboard_state
-from rex.db import connect, ensure_workspace, initialize_database
-from rex.installer import InstallContext, install_scaffold
-from rex.merge_workflow import apply_proposal, create_merge_packet, unified_diff
+from lex.cli import AGENT_NAME_RE, allocate_agent_name, build_session_fingerprint, cmd_agent_identify, normalize_agent_role, resolve_install_options
+from lex.dashboard import load_dashboard_state
+from lex.db import connect, ensure_workspace, initialize_database
+from lex.installer import InstallContext, install_scaffold
+from lex.merge_workflow import apply_proposal, create_merge_packet, unified_diff
 
 
 def test_agent_name_pattern_accepts_expected_shape():
@@ -63,7 +63,7 @@ def test_agent_role_command_updates_role(tmp_path):
     conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-brisk-otter', 'codex', '', '', 'active')")
     conn.commit()
 
-    from rex.cli import main
+    from lex.cli import main
 
     main(["--root", str(tmp_path), "agent", "role", "codex-brisk-otter", "auditor", "--specialty", "security"])
 
@@ -100,7 +100,7 @@ def test_agent_identify_rejects_unknown_specialty_until_added(tmp_path):
 
 
 def test_custom_specialty_can_be_added_then_used(tmp_path):
-    from rex.cli import main
+    from lex.cli import main
 
     main(["--root", str(tmp_path), "specialty", "add", "mobile"])
     cmd_agent_identify(
@@ -146,8 +146,8 @@ def test_install_merge_preserves_existing_agent_files(tmp_path):
     claude_text = claude.read_text(encoding="utf-8")
     assert "Keep this." in agents_text
     assert "Keep that too." in claude_text
-    assert "<!-- rex:begin -->" in agents_text
-    assert "<!-- rex:begin -->" in claude_text
+    assert "<!-- lex:begin -->" in agents_text
+    assert "<!-- lex:begin -->" in claude_text
     assert "AGENTS.md" in result.updated_files
     assert "CLAUDE.md" in result.updated_files
 
@@ -167,8 +167,8 @@ def test_install_skip_leaves_existing_agent_files_unchanged(tmp_path):
     assert agents.read_text(encoding="utf-8") == original
     assert any("left unchanged" in warning for warning in result.warnings)
     gitignore = (tmp_path / ".gitignore").read_text(encoding="utf-8")
-    assert ".rex/rex.db" in gitignore
-    assert ".rex/runtime/" in gitignore
+    assert ".lex/lex.db" in gitignore
+    assert ".lex/runtime/" in gitignore
 
 
 def test_install_overwrite_replaces_existing_agent_files(tmp_path):
@@ -184,7 +184,7 @@ def test_install_overwrite_replaces_existing_agent_files(tmp_path):
 
     agents_text = agents.read_text(encoding="utf-8")
     assert "Keep this." not in agents_text
-    assert "Read `.rex/adapters/codex/AGENTS.md` before starting work." in agents_text
+    assert "Read `.lex/adapters/codex/AGENTS.md` before starting work." in agents_text
     assert any("Overwrote root AGENTS.md and CLAUDE.md" in warning for warning in result.warnings)
 
 
@@ -199,7 +199,7 @@ def test_install_all_policy_uses_local_exclude_and_ignores_created_bridges(tmp_p
     )
 
     exclude_text = (tmp_path / ".git" / "info" / "exclude").read_text(encoding="utf-8")
-    assert ".rex/" in exclude_text
+    assert ".lex/" in exclude_text
     assert "AGENTS.md" in exclude_text
     assert "CLAUDE.md" in exclude_text
     assert "AGENTS.md" in result.created_files

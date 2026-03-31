@@ -4,50 +4,50 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-MANAGED_START = "<!-- rex:begin -->"
-MANAGED_END = "<!-- rex:end -->"
+MANAGED_START = "<!-- lex:begin -->"
+MANAGED_END = "<!-- lex:end -->"
 
 
 SCAFFOLD_FILES: dict[str, str] = {
-    ".rex/ROUTER.md": """# REX Router
+    ".lex/ROUTER.md": """# REX Router
 
 Start here before reading deeper context.
 
 ## Load Order
 
-1. Read `.rex/adapters/shared/protocol.md`
+1. Read `.lex/adapters/shared/protocol.md`
 2. Read the tool-specific adapter for the current agent
-3. Read relevant files in `.rex/context/`
-4. Read task-specific patterns in `.rex/patterns/`
+3. Read relevant files in `.lex/context/`
+4. Read task-specific patterns in `.lex/patterns/`
 
 ## Purpose
 
-`rex` separates durable project memory from live operational state:
+`lex` separates durable project memory from live operational state:
 
-- Markdown files in `.rex/` store shared project knowledge
-- `.rex/rex.db` stores agents, tasks, leases, messages, sessions, and events
+- Markdown files in `.lex/` store shared project knowledge
+- `.lex/lex.db` stores agents, tasks, leases, messages, sessions, and events
 
 Use the CLI for operational updates. Update markdown files intentionally when project knowledge changes.
 """,
-    ".rex/context/architecture.md": """# Architecture
+    ".lex/context/architecture.md": """# Architecture
 
-`rex` is split into three layers:
+`lex` is split into three layers:
 
-- Durable memory: markdown files under `.rex/context/` and `.rex/patterns/`
-- Coordination state: SQLite database at `.rex/rex.db`
-- Adapters: tool-specific instructions under `.rex/adapters/`
+- Durable memory: markdown files under `.lex/context/` and `.lex/patterns/`
+- Coordination state: SQLite database at `.lex/lex.db`
+- Adapters: tool-specific instructions under `.lex/adapters/`
 
 Operational state includes agent sessions and heartbeats so task ownership can be correlated with live presence.
 """,
-    ".rex/context/conventions.md": """# Conventions
+    ".lex/context/conventions.md": """# Conventions
 
 - Agent names must match `<agent>-<adjective>-<noun>`
 - Tasks are single-owner by default
 - Parent tasks may delegate to child tasks in `hypervisor` mode
-- Operational changes should go through the `rex` CLI
+- Operational changes should go through the `lex` CLI
 - Markdown memory should be concise and durable, not used as a chat log
 """,
-    ".rex/context/decisions.md": """# Decisions
+    ".lex/context/decisions.md": """# Decisions
 
 ## Initial Install
 
@@ -55,34 +55,34 @@ Operational state includes agent sessions and heartbeats so task ownership can b
 - Chose SQLite plus append-only events instead of pure event sourcing
 - Chose single-owner task leases with optional delegated child tasks
 """,
-    ".rex/context/setup.md": """# Setup
+    ".lex/context/setup.md": """# Setup
 
 ## Bootstrap
 
 ```bash
-python3 -m rex.cli init
+python3 -m lex.cli init
 ```
 
 ## Register Agents
 
 ```bash
-python3 -m rex.cli agent register codex-brisk-otter codex
-python3 -m rex.cli agent register claude-steady-ibis claude
+python3 -m lex.cli agent register codex-brisk-otter codex
+python3 -m lex.cli agent register claude-steady-ibis claude
 ```
 """,
-    ".rex/context/active-work.md": """# Active Work
+    ".lex/context/active-work.md": """# Active Work
 
-Use `python3 -m rex.cli task list` to inspect live operational state.
+Use `python3 -m lex.cli task list` to inspect live operational state.
 
 This file should only capture durable summaries worth keeping in version control.
 """,
-    ".rex/patterns/INDEX.md": """# Pattern Index
+    ".lex/patterns/INDEX.md": """# Pattern Index
 
 No patterns are registered yet.
 """,
-    ".rex/adapters/shared/protocol.md": """# Shared Protocol
+    ".lex/adapters/shared/protocol.md": """# Shared Protocol
 
-All adapters map into the same `rex` coordination model.
+All adapters map into the same `lex` coordination model.
 
 ## Core Rules
 
@@ -95,7 +95,7 @@ All adapters map into the same `rex` coordination model.
 - Agents may tail inboxes, task threads, and events in follow mode for lightweight live coordination
 - Agents should register active sessions and send heartbeats during longer work intervals
 """,
-    ".rex/adapters/shared/task-lifecycle.md": """# Task Lifecycle
+    ".lex/adapters/shared/task-lifecycle.md": """# Task Lifecycle
 
 - `open`
 - `claimed`
@@ -106,19 +106,19 @@ All adapters map into the same `rex` coordination model.
 - `done`
 - `abandoned`
 """,
-    ".rex/adapters/codex/AGENTS.md": """# Codex Adapter
+    ".lex/adapters/codex/AGENTS.md": """# Codex Adapter
 
-Read `.rex/ROUTER.md` before starting work.
+Read `.lex/ROUTER.md` before starting work.
 
-Use the shared protocol in `.rex/adapters/shared/protocol.md`.
+Use the shared protocol in `.lex/adapters/shared/protocol.md`.
 """,
-    ".rex/adapters/claude/CLAUDE.md": """# Claude Adapter
+    ".lex/adapters/claude/CLAUDE.md": """# Claude Adapter
 
-Read `.rex/ROUTER.md` before starting work.
+Read `.lex/ROUTER.md` before starting work.
 
-Use the shared protocol in `.rex/adapters/shared/protocol.md`.
+Use the shared protocol in `.lex/adapters/shared/protocol.md`.
 """,
-    ".rex/adapters/cursor/cursor-rules.md": """# Cursor Adapter
+    ".lex/adapters/cursor/cursor-rules.md": """# Cursor Adapter
 
 Cursor participates through the same task and message model.
 """,
@@ -154,18 +154,18 @@ def inspect_install_context(root: Path) -> InstallContext:
 
 def codex_bridge_block() -> str:
     return (
-        "## rex\n\n"
+        "## lex\n\n"
         f"{MANAGED_START}\n"
-        "Read `.rex/adapters/codex/AGENTS.md` before starting work.\n"
+        "Read `.lex/adapters/codex/AGENTS.md` before starting work.\n"
         f"{MANAGED_END}\n"
     )
 
 
 def claude_bridge_block() -> str:
     return (
-        "## rex\n\n"
+        "## lex\n\n"
         f"{MANAGED_START}\n"
-        "Read `.rex/adapters/claude/CLAUDE.md` before starting work.\n"
+        "Read `.lex/adapters/claude/CLAUDE.md` before starting work.\n"
         f"{MANAGED_END}\n"
     )
 
@@ -211,7 +211,7 @@ def upsert_managed_block(path: Path, block: str) -> str:
 def update_ignore_file(path: Path, entries: list[str]) -> str:
     ensure_parent(path)
     managed_block = "\n".join(
-        ["# rex ignore policy", MANAGED_START, *entries, MANAGED_END]
+        ["# lex ignore policy", MANAGED_START, *entries, MANAGED_END]
     )
     if not path.exists():
         path.write_text(managed_block + "\n", encoding="utf-8")
@@ -238,8 +238,8 @@ def ignore_entries(ignore_policy: str, *, created_agents: bool) -> list[str]:
     if ignore_policy == "none":
         return []
     if ignore_policy == "runtime":
-        return [".rex/rex.db", ".rex/runtime/"]
-    entries = [".rex/"]
+        return [".lex/lex.db", ".lex/runtime/"]
+    entries = [".lex/"]
     if created_agents:
         entries.extend(["AGENTS.md", "CLAUDE.md"])
     return entries
@@ -290,7 +290,7 @@ def install_scaffold(
             else:
                 result.updated_files.append(relative_path)
         integrated_agents = True
-        result.warnings.append("Overwrote root AGENTS.md and CLAUDE.md with rex bridge files.")
+        result.warnings.append("Overwrote root AGENTS.md and CLAUDE.md with lex bridge files.")
     elif agent_files == "assisted":
         result.warnings.append("Preserved root agent files and prepared for an assisted semantic merge.")
     else:
@@ -310,7 +310,7 @@ def install_scaffold(
         for relative_path in ("AGENTS.md", "CLAUDE.md"):
             if (root / relative_path).exists():
                 result.warnings.append(
-                    f"{relative_path} was left unchanged. Agents will not auto-discover rex until that file references `.rex/`."
+                    f"{relative_path} was left unchanged. Agents will not auto-discover lex until that file references `.lex/`."
                 )
     elif ignore_policy == "all" and integrated_agents and not created_agents:
         result.warnings.append(

@@ -1,6 +1,6 @@
-from rex.cli import main
-from rex.dashboard import load_dashboard_state
-from rex.db import connect, ensure_workspace, initialize_database
+from lex.cli import main
+from lex.dashboard import load_dashboard_state
+from lex.db import connect, ensure_workspace, initialize_database
 
 
 def init_workspace(tmp_path):

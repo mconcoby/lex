@@ -3,7 +3,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rex"
+name = "lex"
 version = "0.1.0"
 description = "Repo-local operating layer for multi-agent coding workflows."
 readme = "README.md"
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-rex = "rex.cli:main"
+lex = "lex.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

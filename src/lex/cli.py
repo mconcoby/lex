@@ -13,10 +13,10 @@ import time
 from pathlib import Path
 from typing import Callable, Sequence
 
-from rex.db import BUILTIN_SPECIALTIES, connect, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths
-from rex.installer import InstallContext, inspect_install_context, install_scaffold
-from rex.merge_workflow import apply_proposal, create_merge_packet, resolve_merge_paths, unified_diff
-from rex.rich_output import (
+from lex.db import BUILTIN_SPECIALTIES, connect, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths
+from lex.installer import InstallContext, inspect_install_context, install_scaffold
+from lex.merge_workflow import apply_proposal, create_merge_packet, resolve_merge_paths, unified_diff
+from lex.rich_output import (
     console,
     print_ok,
     print_info,
@@ -28,7 +28,7 @@ from rex.rich_output import (
     render_task_message_rows,
     render_task_show,
 )
-from rex.tui import run_tui
+from lex.tui import run_tui
 
 
 AGENT_NAME_RE = re.compile(r"^(codex|claude|cursor)-[a-z]+-[a-z]+$")
@@ -338,7 +338,7 @@ def print_dashboard(root: Path) -> None:
     ).fetchone()[0]
     inbox_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
     print("")
-    print(f"rex dashboard  root={root}")
+    print(f"lex dashboard  root={root}")
     print(f"agents={agent_count}  active_sessions={active_session_count}  open_tasks={open_task_count}  messages={inbox_count}")
     print("")
 
@@ -349,7 +349,7 @@ def run_interactive_shell(root: Path) -> None:
         action = prompt_choice(
             "What do you want to do?",
             [
-                ("install", "Install or reconfigure rex in this workspace"),
+                ("install", "Install or reconfigure lex in this workspace"),
                 ("agent_register", "Register an agent"),
                 ("session_start", "Start an agent session"),
                 ("task_create", "Create a task"),
@@ -459,7 +459,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     initialize_database(conn)
     log_event(conn, "workspace.initialized", payload={"root": str(paths.root)})
     conn.commit()
-    print(f"initialized rex in {paths.rex_dir}")
+    print(f"initialized lex in {paths.lex_dir}")
 
 
 def prompt_choice(prompt: str, options: list[tuple[str, str]], default: str) -> str:
@@ -485,7 +485,7 @@ def prompt_choice(prompt: str, options: list[tuple[str, str]], default: str) -> 
 
 
 def print_install_summary(context: InstallContext) -> None:
-    print(f"Installing rex into {context.root}")
+    print(f"Installing lex into {context.root}")
     print("Detected:")
     print(f"  git checkout: {'yes' if context.has_git_dir else 'no'}")
     print(f"  .gitignore: {'yes' if context.has_gitignore else 'no'}")
@@ -497,23 +497,23 @@ def print_install_summary(context: InstallContext) -> None:
 def choose_agent_file_mode(context: InstallContext) -> str:
     if context.has_agents_file or context.has_claude_file:
         prompt = (
-            "How should rex handle existing root agent files?\n"
-            "This controls whether AGENTS.md and CLAUDE.md get a small managed rex bridge block."
+            "How should lex handle existing root agent files?\n"
+            "This controls whether AGENTS.md and CLAUDE.md get a small managed lex bridge block."
         )
         default = "merge"
         options = [
-            ("preserve", "Preserve existing root agent files exactly as they are and install only the .rex scaffold"),
-            ("merge", "Merge a managed rex block into existing root agent files without overwriting other content"),
+            ("preserve", "Preserve existing root agent files exactly as they are and install only the .lex scaffold"),
+            ("merge", "Merge a managed lex block into existing root agent files without overwriting other content"),
             ("assisted", "Preserve root files now and prepare an assisted semantic merge packet for an agent"),
-            ("overwrite", "Overwrite root agent files with rex bridge files"),
+            ("overwrite", "Overwrite root agent files with lex bridge files"),
         ]
     else:
-        prompt = "How should rex expose itself to root agent files?"
+        prompt = "How should lex expose itself to root agent files?"
         default = "merge"
         options = [
-            ("preserve", "Do not create root bridge files; install only the .rex scaffold"),
-            ("merge", "Create root AGENTS.md and CLAUDE.md bridge files that point into .rex"),
-            ("assisted", "Install the .rex scaffold and prepare an assisted merge packet before creating root bridge files"),
+            ("preserve", "Do not create root bridge files; install only the .lex scaffold"),
+            ("merge", "Create root AGENTS.md and CLAUDE.md bridge files that point into .lex"),
+            ("assisted", "Install the .lex scaffold and prepare an assisted merge packet before creating root bridge files"),
             ("overwrite", "Write fresh root bridge files even if they appear later in the install"),
         ]
     return prompt_choice(prompt, options, default)
@@ -522,20 +522,20 @@ def choose_agent_file_mode(context: InstallContext) -> str:
 def choose_ignore_policy(context: InstallContext) -> tuple[str, str]:
     if context.has_git_dir:
         prompt = (
-            "How should rex handle Git ignore rules?\n"
-            "Choose whether to ignore nothing, only runtime state, or the full rex workflow locally."
+            "How should lex handle Git ignore rules?\n"
+            "Choose whether to ignore nothing, only runtime state, or the full lex workflow locally."
         )
         default = "runtime:gitignore"
         options = [
-            ("runtime:gitignore", "Ignore only .rex/rex.db and .rex/runtime/ in the shared .gitignore"),
-            ("all:local-exclude", "Keep rex local-only by writing ignore rules to .git/info/exclude"),
+            ("runtime:gitignore", "Ignore only .lex/lex.db and .lex/runtime/ in the shared .gitignore"),
+            ("all:local-exclude", "Keep lex local-only by writing ignore rules to .git/info/exclude"),
             ("none:gitignore", "Do not add any ignore rules"),
         ]
     else:
-        prompt = "How should rex handle ignore rules in this folder?"
+        prompt = "How should lex handle ignore rules in this folder?"
         default = "runtime:gitignore"
         options = [
-            ("runtime:gitignore", "Create a .gitignore entry for rex runtime state"),
+            ("runtime:gitignore", "Create a .gitignore entry for lex runtime state"),
             ("none:gitignore", "Do not create ignore rules"),
         ]
     combined = prompt_choice(prompt, options, default)
@@ -609,7 +609,7 @@ def cmd_install(args: argparse.Namespace) -> None:
             payload={"agent_kind": assisted_agent, "plan_path": str(merge_paths.plan_path)},
         )
     conn.commit()
-    print(f"installed rex in {root}")
+    print(f"installed lex in {root}")
     if result.created_files:
         print("created:")
         for path in result.created_files:
@@ -628,15 +628,15 @@ def cmd_install(args: argparse.Namespace) -> None:
             print(f"  {warning}")
     if agent_files == "assisted":
         print("next steps:")
-        print(f"  review {root / '.rex' / 'runtime' / 'install-merge-plan.md'}")
-        print("  have the selected agent write proposals into .rex/runtime/install-merge-proposal/")
-        print("  run `rex merge diff` and then `rex merge apply` once approved")
+        print(f"  review {root / '.lex' / 'runtime' / 'install-merge-plan.md'}")
+        print("  have the selected agent write proposals into .lex/runtime/install-merge-proposal/")
+        print("  run `lex merge diff` and then `lex merge apply` once approved")
 
 
 def cmd_merge_plan(args: argparse.Namespace) -> None:
     root = Path(args.root).resolve()
     paths = create_merge_packet(root, agent_kind=args.agent)
-    print(f"created assisted merge packet in {paths.rex_runtime}")
+    print(f"created assisted merge packet in {paths.lex_runtime}")
     print(f"plan: {paths.plan_path}")
     print(f"context: {paths.context_dir}")
     print(f"proposal target: {paths.proposal_dir}")
@@ -1529,7 +1529,7 @@ def add_follow_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="rex")
+    parser = argparse.ArgumentParser(prog="lex")
     parser.add_argument("--root", default=".", help="workspace root")
     subparsers = parser.add_subparsers(dest="command")
 

@@ -1,5 +1,5 @@
-from rex.cli import main
-from rex.db import connect, ensure_workspace, initialize_database
+from lex.cli import main
+from lex.db import connect, ensure_workspace, initialize_database
 
 
 def init_workspace(tmp_path):

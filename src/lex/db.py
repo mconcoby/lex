@@ -7,8 +7,8 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_REX_DIRNAME = ".rex"
-DEFAULT_DB_NAME = "rex.db"
+DEFAULT_LEX_DIRNAME = ".lex"
+DEFAULT_DB_NAME = "lex.db"
 ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
     "engineer": ("dev", "engineer"),
     "devops": ("dev", "devops"),
@@ -186,16 +186,16 @@ AGENT_REQUIRED_COLUMNS: dict[str, str] = {
 
 
 @dataclass(frozen=True)
-class RexPaths:
+class LexPaths:
     root: Path
-    rex_dir: Path
+    lex_dir: Path
     db_path: Path
 
 
-def resolve_paths(root: str | Path | None = None) -> RexPaths:
+def resolve_paths(root: str | Path | None = None) -> LexPaths:
     workspace_root = Path(root or Path.cwd()).resolve()
-    rex_dir = workspace_root / DEFAULT_REX_DIRNAME
-    return RexPaths(root=workspace_root, rex_dir=rex_dir, db_path=rex_dir / DEFAULT_DB_NAME)
+    lex_dir = workspace_root / DEFAULT_LEX_DIRNAME
+    return LexPaths(root=workspace_root, lex_dir=lex_dir, db_path=lex_dir / DEFAULT_DB_NAME)
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -271,9 +271,9 @@ def log_event(
     )
 
 
-def ensure_workspace(root: str | Path | None = None) -> RexPaths:
+def ensure_workspace(root: str | Path | None = None) -> LexPaths:
     paths = resolve_paths(root)
-    paths.rex_dir.mkdir(parents=True, exist_ok=True)
+    paths.lex_dir.mkdir(parents=True, exist_ok=True)
     return paths
 
 

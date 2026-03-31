@@ -4,7 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-from rex.db import connect, ensure_workspace, initialize_database
+from lex.db import connect, ensure_workspace, initialize_database
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,5 @@
-from rex.dashboard import load_dashboard_state
-from rex.db import connect, ensure_workspace, initialize_database
+from lex.dashboard import load_dashboard_state
+from lex.db import connect, ensure_workspace, initialize_database
 
 
 def test_dashboard_state_includes_active_sessions_tasks_and_messages(tmp_path):
