@@ -22,6 +22,7 @@ _C_HEADER        = 12
 _C_BORDER        = 13
 _C_FOCUS_BORDER  = 14
 _C_STATUS_BAR    = 15
+_C_GEMINI        = 16
 
 
 def _init_colors() -> bool:
@@ -45,6 +46,7 @@ def _init_colors() -> bool:
     curses.init_pair(_C_BORDER,       curses.COLOR_WHITE,   bg)
     curses.init_pair(_C_FOCUS_BORDER, curses.COLOR_CYAN,    bg)
     curses.init_pair(_C_STATUS_BAR,   curses.COLOR_BLACK,   curses.COLOR_WHITE)
+    curses.init_pair(_C_GEMINI,       curses.COLOR_BLUE,    bg)
     return True
 
 
@@ -74,6 +76,7 @@ AGENT_COLOR: dict[str, int] = {
     "codex":  _C_CODEX,
     "claude": _C_CLAUDE,
     "cursor": _C_CURSOR,
+    "gemini": _C_GEMINI,
 }
 
 MSG_TYPE_COLOR: dict[str, int] = {
@@ -244,19 +247,35 @@ class RexTui:
             label_text = session["label"] or "-"
             kind = session.get("agent_kind", "")
             agent_color = AGENT_COLOR.get(kind, _C_DIM)
-            stale_prefix = "!" if session.get("is_stale") else " "
+            has_contract_issue = (
+                session.get("bootstrap_pending")
+                or session.get("pending_required_actions")
+                or session.get("unacked_watches")
+                or session.get("role_drift_events")
+            )
+            stale_prefix = "!" if session.get("is_stale") or has_contract_issue else " "
             role_text = session.get("agent_role") or "-"
             specialty_text = session.get("agent_specialty") or ""
             role_label = role_text if not specialty_text else f"{role_text}/{specialty_text}"
-            line = f"{stale_prefix}{session['id']:>3}  {session['agent_name']:<22}  {role_label:<12}  {label_text:<14}  {session['heartbeat_at']}"
+            compliance = []
+            if session.get("bootstrap_pending"):
+                compliance.append("bootstrap")
+            if session.get("pending_required_actions"):
+                compliance.append("actions")
+            if session.get("unacked_watches"):
+                compliance.append("acks")
+            if session.get("role_drift_events"):
+                compliance.append("drift")
+            compliance_text = ",".join(compliance) if compliance else "-"
+            line = f"{stale_prefix}{session['id']:>3}  {session['agent_name']:<22}  {role_label:<12}  {label_text:<14}  {compliance_text:<16}  {session['heartbeat_at']}"
             if is_sel:
                 attr = self._cp(_C_HIGHLIGHT)
                 stdscr.addnstr(y + 1 + idx, x + 1, line, w - 2, attr)
             else:
-                stdscr.addnstr(y + 1 + idx, x + 1, stale_prefix, 1, self._cp(_C_BLOCKED if session.get("is_stale") else _C_DIM, bold=session.get("is_stale")))
+                stdscr.addnstr(y + 1 + idx, x + 1, stale_prefix, 1, self._cp(_C_BLOCKED if session.get("is_stale") or has_contract_issue else _C_DIM, bold=session.get("is_stale") or has_contract_issue))
                 stdscr.addnstr(y + 1 + idx, x + 2, f"{session['id']:>3}  ", 5)
                 stdscr.addnstr(y + 1 + idx, x + 7, f"{session['agent_name']:<22}", 22, self._cp(agent_color))
-                rest = f"  {role_label:<12}  {label_text:<14}  {session['heartbeat_at']}"
+                rest = f"  {role_label:<12}  {label_text:<14}  {compliance_text:<16}  {session['heartbeat_at']}"
                 stdscr.addnstr(y + 1 + idx, x + 29, rest, max(w - 31, 1), self._cp(_C_DIM))
 
     def _draw_task_detail(self, stdscr, y: int, x: int, h: int, w: int) -> None:
@@ -414,6 +433,7 @@ class RexTui:
                 "parent_task": None,
                 "delegation_mode": "direct",
                 "path": [],
+                "force_role_override": False,
             })()
         )
         self.status = f"✔ created task: {title}"
@@ -436,6 +456,7 @@ class RexTui:
                 "task_id": task["id"],
                 "agent": agent,
                 "ttl_minutes": 30,
+                "force_role_override": False,
             })()
         )
         self.status = f"✔ claimed task {task['id']} for {agent}"
@@ -463,8 +484,8 @@ class RexTui:
     def _register_agent(self, stdscr) -> None:
         from lex.cli import cmd_agent_identify, cmd_agent_register
 
-        kind = self._prompt_choice(stdscr, "agent kind", ["codex", "claude", "cursor"], "codex")
-        role = self._prompt_choice(stdscr, "agent role", ["dev", "pm", "auditor"], "dev")
+        kind = self._prompt_choice(stdscr, "agent kind", ["codex", "claude", "cursor", "gemini"], "codex")
+        role = self._prompt_choice(stdscr, "agent role", ["dev", "pm", "auditor", "infra"], "dev")
         specialty = self._prompt(stdscr, "agent specialty (optional)")
         name = self._prompt(stdscr, "agent name (blank to generate)")
         if name:
@@ -573,6 +594,7 @@ class RexTui:
                 "task_id": task["id"],
                 "agent": agent,
                 "status": status,
+                "force_role_override": False,
             })()
         )
         self.status = f"✔ task {task['id']} → {status}"
@@ -605,6 +627,7 @@ class RexTui:
                 "priority": None,
                 "ttl_minutes": 30,
                 "path": [],
+                "force_role_override": False,
             })()
         )
         self.status = f"✔ delegated child task from #{task['id']} to {assignee}"
@@ -630,6 +653,7 @@ class RexTui:
                 "to_agent": to_agent,
                 "subject": None,
                 "body": body,
+                "force_role_override": False,
             })()
         )
         self.status = f"✔ handed off task #{task['id']} to {to_agent}"

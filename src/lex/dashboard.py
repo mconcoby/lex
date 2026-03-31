@@ -66,11 +66,37 @@ def _query_sessions(conn: sqlite3.Connection) -> list[dict]:
             s.started_at,
             s.heartbeat_at,
             CASE
+                WHEN sb.acknowledged_at IS NULL THEN 1
+                ELSE 0
+            END AS bootstrap_pending,
+            (
+                SELECT COUNT(*)
+                FROM json_each(sb.required_actions_json) req
+                WHERE req.value NOT IN (
+                    SELECT sar.action_key
+                    FROM session_action_receipts sar
+                    WHERE sar.session_id = s.id
+                )
+            ) AS pending_required_actions,
+            (
+                SELECT COUNT(*)
+                FROM watches w
+                WHERE w.agent_id = s.agent_id
+                  AND w.last_sent_event_id > w.last_ack_event_id
+            ) AS unacked_watches,
+            (
+                SELECT COUNT(*)
+                FROM events e
+                WHERE e.session_id = s.id
+                  AND e.event_type = 'role.drift_detected'
+            ) AS role_drift_events,
+            CASE
                 WHEN s.heartbeat_at < datetime('now', '-15 minutes') THEN 1
                 ELSE 0
             END AS is_stale
         FROM sessions s
         JOIN agents a ON a.id = s.agent_id
+        LEFT JOIN session_bootstraps sb ON sb.session_id = s.id
         WHERE s.status = 'active' AND s.ended_at IS NULL
         ORDER BY s.id DESC
         LIMIT 10

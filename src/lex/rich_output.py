@@ -40,6 +40,7 @@ AGENT_STYLE: dict[str, str] = {
     "codex":  "bright_cyan",
     "claude": "bright_magenta",
     "cursor": "bright_yellow",
+    "gemini": "bright_blue",
 }
 
 MSG_TYPE_STYLE: dict[str, str] = {

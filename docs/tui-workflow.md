@@ -31,6 +31,11 @@ The selected-task pane shows:
 - recent child tasks
 - recent task-thread messages
 
+Execution note:
+- The current repo now includes a supervised worker and dispatch control plane in the CLI.
+- Worker launch approval, runtime lifecycle, and packet delivery still run through `lex worker ...` and `lex dispatch ...` commands while TUI integration catches up.
+- Session bootstrap acknowledgement, required-action completion, and watch acknowledgements currently run through `lex session ...` and `lex watch ...` commands.
+
 ## Session Actions
 
 - `a`: register an agent
@@ -41,7 +46,7 @@ The selected-task pane shows:
 ## Visual Warnings
 
 - `!` in the task list indicates a lease that is close to expiring
-- `!` in the session list indicates a stale session heartbeat
+- `!` in the session list indicates a stale heartbeat or a compliance problem such as pending bootstrap, incomplete first actions, unacked subscriptions, or recorded role drift
 
 ## Usage Notes
 
