@@ -1,9 +1,6 @@
 .venv/
 src/*.egg-info/
-tests/__pycache__/
-.pytest_cache/
-.venv/
-src/*.egg-info/
+src/lex/__pycache__/
 tests/__pycache__/
 .pytest_cache/
 
