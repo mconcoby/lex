@@ -1,0 +1,183 @@
+# rex
+
+`rex` is a repo-local operating layer for coding agents.
+
+The v1 implementation in this repository provides:
+
+- A durable `.rex/` scaffold for project memory
+- A SQLite-backed coordination store for agents, tasks, leases, and messages
+- A Python CLI for bootstrapping, live agent presence, and concurrent task coordination
+
+## Quick start
+
+The default entrypoint is now a TUI:
+
+```bash
+python3 -m rex.cli
+```
+
+That opens a terminal dashboard for the common workflow: install, register agents, start sessions, create or claim tasks, inspect inboxes, and run merge review actions. If a full terminal UI is not available, rex falls back to the simpler interactive shell.
+
+Current TUI hotkeys:
+- `a` register agent
+- `tab` switch focus between tasks and sessions
+- `h` heartbeat a session
+- `x` end a session
+- `m` send a message on the selected task
+- `t` change selected task status
+- `s` start session
+- `n` create task
+- `c` claim selected task
+- `j` / `k` move task selection
+- `r` refresh
+- `q` quit
+
+The first step for a new agent instance should be identification. Rex can allocate a unique instance name so two Codex terminals do not accidentally reuse the same identity:
+
+```bash
+python3 -m rex.cli agent identify codex
+```
+
+That registers a unique name like `codex-brisk-otter`. If you want to choose a name yourself, pass `--name`, and Rex will reject duplicates.
+Agents now use a two-part org model:
+- canonical primary role: `dev`, `pm`, or `auditor`
+- built-in specialties: `frontend`, `infra`, `ux`, `security`, `release`
+- user-defined specialties can be added per workspace
+
+The subcommands still exist for scripting and direct control:
+
+```bash
+python3 -m rex.cli init
+python3 -m rex.cli agent identify codex --role dev --specialty frontend
+python3 -m rex.cli task create "Define schema"
+python3 -m rex.cli task claim 1 codex-brisk-otter
+python3 -m rex.cli msg send --task 1 --from codex-brisk-otter --type note --body "Schema draft started."
+python3 -m rex.cli task list
+```
+
+## Install Into Another Project
+
+The default experience is interactive:
+
+```bash
+python3 -m rex.cli --root /path/to/project install
+```
+
+`rex install` detects whether the target already has `AGENTS.md`, `CLAUDE.md`, and a Git checkout, then walks the user through:
+- whether to preserve, merge, assisted-merge, or overwrite root agent files
+- whether to ignore only runtime state or keep rex local-only
+- whether ignore rules belong in `.gitignore` or `.git/info/exclude`
+
+For scripted installs, a non-interactive path still exists.
+
+For a new or shared project workflow, merge `rex` into root agent files and keep only runtime state out of Git:
+
+```bash
+python3 -m rex.cli --root /path/to/project install --non-interactive --agent-files merge --ignore-policy runtime --ignore-target gitignore
+```
+
+For an existing project where you do not want to touch `AGENTS.md` or `CLAUDE.md`, preserve those files and install only the scaffold:
+
+```bash
+python3 -m rex.cli --root /path/to/project install --non-interactive --agent-files preserve --ignore-policy runtime --ignore-target gitignore
+```
+
+For a local-only workflow, keep `rex` out of the shared repo index by writing ignore rules to `.git/info/exclude`:
+
+```bash
+python3 -m rex.cli --root /path/to/project install --non-interactive --agent-files merge --ignore-policy all --ignore-target local-exclude
+```
+
+Agent-file integration modes:
+- `preserve`: leave root agent files untouched
+- `merge`: append or update a managed rex block without overwriting user content
+- `assisted`: preserve root files for now and generate a merge packet for an agent to propose semantic edits
+- `overwrite`: replace root agent files with rex bridge files
+
+## Assisted Merge
+
+For repos with meaningful existing agent architecture, choose `assisted` in the install wizard or run:
+
+```bash
+python3 -m rex.cli --root /path/to/project install --non-interactive --agent-files assisted --assisted-agent codex
+python3 -m rex.cli --root /path/to/project merge diff
+python3 -m rex.cli --root /path/to/project merge apply
+```
+
+The assisted flow writes:
+- `.rex/runtime/install-merge-plan.md`
+- `.rex/runtime/install-merge-context/`
+- `.rex/runtime/install-merge-proposal/`
+
+An agent can prepare proposed `AGENTS.md` and `CLAUDE.md` files in the proposal directory. `merge diff` shows the proposed changes, and `merge apply` writes only the approved proposal files back to the project root.
+
+## Delegation
+
+Hypervisor-style parent tasks can delegate child work while retaining ownership of the parent.
+
+```bash
+python3 -m rex.cli task create "Ship coordination UX" --created-by codex-brisk-otter --delegation-mode hypervisor
+python3 -m rex.cli task claim 2 codex-brisk-otter
+python3 -m rex.cli task delegate 2 codex-brisk-otter claude-steady-ibis "Review message model" --body "Inspect task messaging and suggest improvements."
+python3 -m rex.cli task show 2
+```
+
+## Read-Side Coordination
+
+Use these commands to inspect current state without mutating it:
+
+```bash
+python3 -m rex.cli task show 1
+python3 -m rex.cli msg task 1
+python3 -m rex.cli event list --task 1
+```
+
+For live coordination, the same commands support follow mode:
+
+```bash
+python3 -m rex.cli msg inbox claude-steady-ibis --follow
+python3 -m rex.cli msg task 3 --follow
+python3 -m rex.cli event list --task 3 --follow
+```
+
+## Sessions
+
+Sessions make agent presence explicit so `rex` can distinguish a live owner from a stale one.
+
+```bash
+python3 -m rex.cli agent identify codex --role dev --specialty frontend
+python3 -m rex.cli session start codex-brisk-otter --label primary
+python3 -m rex.cli session heartbeat 1
+python3 -m rex.cli session list --active-only
+python3 -m rex.cli task show 2
+python3 -m rex.cli session end 1
+```
+
+## Agent Roles
+
+Roles are split into a canonical primary role plus optional specialty so Rex can mirror software-organization responsibilities without copying a human org chart too literally.
+
+```bash
+python3 -m rex.cli agent identify codex --role pm --specialty ux
+python3 -m rex.cli agent register claude-steady-ibis claude --role auditor --specialty security
+python3 -m rex.cli agent list
+```
+
+Built-in specialties:
+- `frontend`
+- `infra`
+- `ux`
+- `security`
+- `release`
+
+To add a custom specialty for a workspace:
+
+```bash
+python3 -m rex.cli specialty add tech_lead
+python3 -m rex.cli agent role codex-brisk-otter dev --specialty tech_lead
+```
+
+Recommended mapping:
+- `dev`: implementation and technical execution
+- `pm`: planning, design, scoping, release coordination
+- `auditor`: review, verification, compliance, regression checking
