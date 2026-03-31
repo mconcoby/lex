@@ -10,6 +10,7 @@ from lex.db import connect, ensure_workspace, initialize_database
 @dataclass(frozen=True)
 class DashboardState:
     root: Path
+    summary: dict
     agents: list[dict]
     sessions: list[dict]
     tasks: list[dict]
@@ -24,6 +25,7 @@ def load_dashboard_state(root: Path) -> DashboardState:
     initialize_database(conn)
     return DashboardState(
         root=root,
+        summary=_query_summary(conn),
         agents=_query_agents(conn),
         sessions=_query_sessions(conn),
         tasks=_query_tasks(conn),
@@ -35,6 +37,122 @@ def load_dashboard_state(root: Path) -> DashboardState:
 
 def _rows(conn: sqlite3.Connection, query: str, params: tuple = ()) -> list[dict]:
     return [dict(row) for row in conn.execute(query, params).fetchall()]
+
+
+def _query_summary(conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        """
+        WITH active_sessions AS (
+            SELECT
+                s.id,
+                s.agent_id,
+                s.git_branch,
+                COALESCE(s.git_dirty, 0) AS git_dirty,
+                CASE
+                    WHEN sb.acknowledged_at IS NULL THEN 1
+                    ELSE 0
+                END AS bootstrap_pending,
+                (
+                    SELECT COUNT(*)
+                    FROM json_each(sb.required_actions_json) req
+                    WHERE req.value NOT IN (
+                        SELECT sar.action_key
+                        FROM session_action_receipts sar
+                        WHERE sar.session_id = s.id
+                    )
+                ) AS pending_required_actions,
+                (
+                    SELECT COUNT(*)
+                    FROM watches w
+                    WHERE w.agent_id = s.agent_id
+                      AND w.last_sent_event_id > w.last_ack_event_id
+                ) AS unacked_watches,
+                (
+                    SELECT COUNT(*)
+                    FROM events e
+                    WHERE e.session_id = s.id
+                      AND e.event_type = 'role.drift_detected'
+                ) AS role_drift_events,
+                CASE
+                    WHEN s.heartbeat_at < datetime('now', '-15 minutes') THEN 1
+                    ELSE 0
+                END AS is_stale
+            FROM sessions s
+            LEFT JOIN session_bootstraps sb ON sb.session_id = s.id
+            WHERE s.status = 'active' AND s.ended_at IS NULL
+        ),
+        active_leases AS (
+            SELECT tl.task_id, tl.session_id, tl.expires_at
+            FROM task_leases tl
+            JOIN (
+                SELECT task_id, MAX(id) AS max_id
+                FROM task_leases
+                WHERE state = 'active' AND released_at IS NULL
+                GROUP BY task_id
+            ) latest ON latest.max_id = tl.id
+        ),
+        latest_task_message AS (
+            SELECT m.task_id, m.type
+            FROM messages m
+            JOIN (
+                SELECT task_id, MAX(id) AS max_id
+                FROM messages
+                WHERE task_id IS NOT NULL
+                GROUP BY task_id
+            ) latest ON latest.max_id = m.id
+        ),
+        task_flags AS (
+            SELECT
+                t.id,
+                t.status,
+                CASE
+                    WHEN lease.expires_at IS NOT NULL
+                     AND lease.expires_at < datetime('now', '+5 minutes') THEN 1
+                    ELSE 0
+                END AS lease_expiring,
+                CASE
+                    WHEN t.status IN ('review_requested', 'handoff_pending') THEN 1
+                    WHEN latest_task_message.type IN ('review_request', 'handoff') THEN 1
+                    ELSE 0
+                END AS review_needed,
+                CASE
+                    WHEN t.status = 'blocked' THEN 1
+                    ELSE 0
+                END AS is_blocked,
+                CASE
+                    WHEN t.status IN ('done', 'abandoned') THEN 0
+                    WHEN lease.expires_at IS NOT NULL
+                     AND lease.expires_at < datetime('now', '+5 minutes') THEN 1
+                    WHEN owner_session.is_stale = 1 THEN 1
+                    WHEN owner_session.bootstrap_pending = 1 THEN 1
+                    WHEN owner_session.pending_required_actions > 0 THEN 1
+                    WHEN owner_session.unacked_watches > 0 THEN 1
+                    WHEN owner_session.role_drift_events > 0 THEN 1
+                    WHEN owner_session.git_dirty = 1 THEN 1
+                    ELSE 0
+                END AS is_risky
+            FROM tasks t
+            LEFT JOIN active_leases lease ON lease.task_id = t.id
+            LEFT JOIN active_sessions owner_session ON owner_session.agent_id = t.owner_agent_id
+            LEFT JOIN latest_task_message ON latest_task_message.task_id = t.id
+        )
+        SELECT
+            (SELECT COUNT(*) FROM active_sessions WHERE is_stale = 1) AS stale_sessions,
+            (SELECT COUNT(*) FROM task_flags WHERE is_blocked = 1) AS blocked_tasks,
+            (SELECT COUNT(*) FROM task_flags WHERE review_needed = 1) AS review_needed_tasks,
+            (SELECT COUNT(*) FROM task_flags WHERE is_risky = 1) AS risky_tasks,
+            (SELECT COUNT(*) FROM active_sessions WHERE git_dirty = 1) AS dirty_sessions,
+            (SELECT COUNT(*) FROM active_sessions WHERE bootstrap_pending = 1 OR pending_required_actions > 0 OR unacked_watches > 0 OR role_drift_events > 0) AS sessions_needing_attention
+        """
+    ).fetchone()
+    return dict(row) if row is not None else {
+        "stale_sessions": 0,
+        "blocked_tasks": 0,
+        "review_needed_tasks": 0,
+        "risky_tasks": 0,
+        "dirty_sessions": 0,
+        "sessions_needing_attention": 0,
+    }
 
 
 def _query_agents(conn: sqlite3.Connection) -> list[dict]:

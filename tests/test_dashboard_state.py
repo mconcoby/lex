@@ -171,3 +171,80 @@ def test_dashboard_state_surfaces_bootstrap_and_ack_compliance(tmp_path):
     assert state.sessions[0]["pending_required_actions"] == 2
     assert state.sessions[0]["unacked_watches"] == 1
     assert state.sessions[0]["role_drift_events"] == 1
+
+
+def test_dashboard_summary_counts_operator_attention_signals(tmp_path):
+    paths = ensure_workspace(tmp_path)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+
+    conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-dev-otter', 'codex', 'dev', '', 'active')")
+    conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('claude-auditor-ibis', 'claude', 'auditor', '', 'active')")
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, cwd, capabilities_json, heartbeat_at, git_dirty)
+        VALUES (1, 'primary', 'active', ?, '{}', datetime('now', '-20 minutes'), 1)
+        """,
+        (str(tmp_path),),
+    )
+    conn.execute(
+        """
+        INSERT INTO session_bootstraps (
+            session_id, agent_id, role_contract_json, memory_json, system_prompt, workflow_template_json, required_actions_json
+        )
+        VALUES (1, 1, '{}', '{}', '', '[]', '["review_inbox"]')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (title, status, priority, owner_agent_id, delegation_mode)
+        VALUES ('Blocked task', 'blocked', 1, 1, 'direct')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (title, status, priority, owner_agent_id, delegation_mode)
+        VALUES ('Review task', 'review_requested', 2, 1, 'direct')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO tasks (title, status, priority, owner_agent_id, delegation_mode)
+        VALUES ('Handoff task', 'claimed', 3, 1, 'direct')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO task_leases (task_id, agent_id, session_id, expires_at)
+        VALUES (1, 1, 1, datetime('now', '+2 minutes'))
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO messages (task_id, from_agent_id, to_agent_id, type, subject, body)
+        VALUES (2, 2, 1, 'review_request', 'review', 'Needs review')
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO messages (task_id, from_agent_id, to_agent_id, type, subject, body)
+        VALUES (3, 1, 2, 'handoff', 'handoff', 'Needs operator handoff review')
+        """
+    )
+    conn.execute("INSERT INTO watches (agent_id, task_id, last_sent_event_id, last_ack_event_id) VALUES (1, 1, 2, 1)")
+    conn.execute(
+        """
+        INSERT INTO events (event_type, task_id, agent_id, session_id, payload_json)
+        VALUES ('role.drift_detected', 1, 1, 1, '{}')
+        """
+    )
+    conn.commit()
+
+    state = load_dashboard_state(tmp_path)
+
+    assert state.summary["stale_sessions"] == 1
+    assert state.summary["blocked_tasks"] == 1
+    assert state.summary["review_needed_tasks"] == 2
+    assert state.summary["dirty_sessions"] == 1
+    assert state.summary["sessions_needing_attention"] == 1
+    assert state.summary["risky_tasks"] == 3

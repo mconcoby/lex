@@ -291,6 +291,14 @@ def test_dashboard_state_loads_empty_workspace(tmp_path):
     state = load_dashboard_state(tmp_path)
 
     assert state.root == tmp_path
+    assert state.summary == {
+        "blocked_tasks": 0,
+        "dirty_sessions": 0,
+        "review_needed_tasks": 0,
+        "risky_tasks": 0,
+        "sessions_needing_attention": 0,
+        "stale_sessions": 0,
+    }
     assert state.agents == []
     assert state.sessions == []
     assert state.tasks == []

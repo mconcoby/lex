@@ -21,7 +21,7 @@ ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
 }
 CANONICAL_ROLES = {"dev", "pm", "auditor", "infra"}
 BUILTIN_SPECIALTIES = ("frontend", "infra", "ux", "security", "release")
-VALID_AGENT_KINDS = ("codex", "claude", "cursor", "gemini")
+VALID_AGENT_KINDS = ("codex", "claude", "cursor", "gemini", "ci", "automated")
 # agents.status is intentionally restricted to 'active' only.
 # Lex does not soft-delete agents; stale agent records are reconciled by the PM
 # (removed or merged) rather than deactivated. If agent lifecycle states are
@@ -90,7 +90,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
     CREATE TABLE IF NOT EXISTS agents (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE,
-        kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor', 'gemini')),
+        kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor', 'gemini', 'ci', 'automated')),
         role TEXT NOT NULL DEFAULT '',
         specialty TEXT NOT NULL DEFAULT '',
         status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active')),
@@ -602,18 +602,18 @@ def migrate_database(conn: sqlite3.Connection) -> None:
 
 
 def migrate_agent_kinds(conn: sqlite3.Connection) -> None:
-    """Rebuild agents table if the kind CHECK constraint doesn't include gemini."""
+    """Rebuild agents table if the kind CHECK constraint is missing ci or automated."""
     schema = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'"
     ).fetchone()
-    if schema is None or "'gemini'" in schema["sql"]:
+    if schema is None or ("'ci'" in schema["sql"] and "'automated'" in schema["sql"]):
         return
     conn.execute("PRAGMA foreign_keys = OFF;")
     conn.execute("""
         CREATE TABLE agents_new (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL UNIQUE,
-            kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor', 'gemini')),
+            kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor', 'gemini', 'ci', 'automated')),
             role TEXT NOT NULL DEFAULT '',
             specialty TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active')),
@@ -672,6 +672,29 @@ def log_event(
             """,
             (event_id, event_id, task_id),
         )
+
+
+def derive_event_provenance(
+    *,
+    agent_kind: str | None,
+    session_id: int | None,
+    task_parent_id: int | None = None,
+) -> str:
+    """Derive the provenance category for a recorded action.
+
+    Categories (evaluated in priority order):
+    - automated: agent kind is 'ci' or 'automated'
+    - delegated: action is in a child task (parent_task_id set) and session-backed
+    - interactive: action is backed by a live session
+    - loose: no session — one-off CLI call, still attributed to the agent
+    """
+    if agent_kind in ("ci", "automated"):
+        return "automated"
+    if session_id is not None:
+        if task_parent_id is not None:
+            return "delegated"
+        return "interactive"
+    return "loose"
 
 
 def _normalize_path(p: str) -> tuple[str, ...]:

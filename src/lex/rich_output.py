@@ -9,6 +9,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from lex.db import derive_event_provenance
+
 console = Console()
 
 
@@ -158,6 +160,14 @@ def render_session_list(rows: list[sqlite3.Row]) -> None:
     console.print(table)
 
 
+_PROVENANCE_STYLE: dict[str, str] = {
+    "interactive": "green",
+    "delegated":   "blue",
+    "loose":       "yellow",
+    "automated":   "bright_black",
+}
+
+
 def render_event_list(rows: list[sqlite3.Row]) -> None:
     table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold", expand=False)
     table.add_column("#", style="bright_black", width=4, justify="right")
@@ -165,18 +175,26 @@ def render_event_list(rows: list[sqlite3.Row]) -> None:
     table.add_column("Task", width=5, justify="right", style="bright_black")
     table.add_column("Agent", min_width=22)
     table.add_column("Role", min_width=14)
+    table.add_column("Src", width=11)
     table.add_column("Event")
     table.add_column("Payload", style="bright_black")
     for row in rows:
         payload = json.loads(row["payload_json"])
         payload_str = json.dumps(payload, sort_keys=True) if payload else ""
         task_str = str(row["task_id"]) if row["task_id"] is not None else ""
+        provenance = derive_event_provenance(
+            agent_kind=row["agent_kind"] if "agent_kind" in row.keys() else None,
+            session_id=row["session_id"] if "session_id" in row.keys() else None,
+            task_parent_id=row["parent_task_id"] if "parent_task_id" in row.keys() else None,
+        )
         table.add_row(
             str(row["id"]),
             row["created_at"],
             task_str,
             row["agent_name"] or "-",
-            _role_label(row["agent_role"], row["agent_specialty"]),
+            _role_label(row["agent_role"] if "agent_role" in row.keys() else None,
+                        row["agent_specialty"] if "agent_specialty" in row.keys() else None),
+            Text(provenance, style=_PROVENANCE_STYLE.get(provenance, "")),
             Text(row["event_type"], style="cyan"),
             payload_str,
         )

@@ -179,6 +179,10 @@ class RexTui:
             f"  sessions={len(self.state.sessions)}"
             f"  tasks={len(self.state.tasks)}"
             f"  messages={len(self.state.inbox)}"
+            f"  stale={self.state.summary['stale_sessions']}"
+            f"  blocked={self.state.summary['blocked_tasks']}"
+            f"  review={self.state.summary['review_needed_tasks']}"
+            f"  risky={self.state.summary['risky_tasks']}"
         )
         stdscr.addnstr(0, 0, root_str, max(width - len(summary) - 1, 0))
         if len(root_str) + len(summary) < width:
