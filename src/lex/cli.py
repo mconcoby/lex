@@ -34,9 +34,11 @@ from lex.coordination import (
     get_task_with_owner,
     get_worker_definition,
     get_worker_runtime,
+    enforce_roster_preflight,
+    retire_agent,
     release_stale_leases,
 )
-from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths
+from lex.db import BUILTIN_SPECIALTIES, connect, derive_event_provenance, detect_path_conflicts, ensure_workspace, fetch_one, initialize_database, list_specialties, log_event, resolve_paths, run_roster_preflight
 from lex.dispatch import (
     VALID_WORKER_APPROVAL_POLICIES,
     command_preview,
@@ -677,6 +679,61 @@ def cmd_agent_list(args: argparse.Namespace) -> None:
     render_agent_list(rows)
 
 
+def cmd_agent_preflight(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    issues = run_roster_preflight(conn)
+    if args.json:
+        emit_json(issues)
+        return
+    if not issues:
+        print_ok("roster preflight passed — no drift detected")
+        return
+    from lex.coordination import PREFLIGHT_FATAL_KINDS
+    for issue in issues:
+        severity = "FAIL" if issue["kind"] in PREFLIGHT_FATAL_KINDS else "WARN"
+        print(f"[{severity}] [{issue['kind']}] {issue['agent_name']}: {issue['detail']}")
+    fatal = [i for i in issues if i["kind"] in PREFLIGHT_FATAL_KINDS]
+    if fatal:
+        raise SystemExit(f"preflight failed: {len(fatal)} fatal issue(s) must be resolved")
+
+
+def cmd_agent_retire(args: argparse.Namespace) -> None:
+    paths = resolve_paths(args.root)
+    conn = connect(paths.db_path)
+    initialize_database(conn)
+    agent = get_agent(conn, args.agent)
+    if agent["status"] == "retired":
+        raise SystemExit(f"agent {args.agent} is already retired")
+    retiring_agent = get_agent(conn, args.by) if args.by else None
+    # Warn if agent still owns active tasks
+    active_tasks = conn.execute(
+        """
+        SELECT id, title FROM tasks
+        WHERE owner_agent_id = ?
+          AND status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending')
+        """,
+        (agent["id"],),
+    ).fetchall()
+    if active_tasks and not args.force:
+        task_list = ", ".join(f"#{t['id']} {t['title']!r}" for t in active_tasks)
+        raise SystemExit(
+            f"agent {args.agent} owns active tasks: {task_list}\n"
+            "Reassign tasks first, or use --force to retire anyway."
+        )
+    retire_agent(
+        conn,
+        agent_id=agent["id"],
+        agent_name=agent["name"],
+        retiring_agent_id=retiring_agent["id"] if retiring_agent else None,
+    )
+    conn.commit()
+    print_ok(f"agent {args.agent} retired")
+    if active_tasks:
+        print_info(f"note: {len(active_tasks)} active task(s) were left unassigned — reassign them to unblock the roster")
+
+
 def cmd_specialty_add(args: argparse.Namespace) -> None:
     paths = ensure_workspace(args.root)
     conn = connect(paths.db_path)
@@ -714,6 +771,7 @@ def cmd_session_start(args: argparse.Namespace) -> None:
     conn = connect(paths.db_path)
     initialize_database(conn)
     agent = get_agent(conn, args.agent)
+    enforce_roster_preflight(conn, exclude_reconnecting_agent_id=agent["id"])
     fingerprint = args.fingerprint
     fingerprint_label = args.fingerprint_label
     if fingerprint is None or fingerprint_label is None:
@@ -1681,6 +1739,7 @@ def cmd_worker_start(args: argparse.Namespace) -> None:
     paths = resolve_paths(args.root)
     conn = connect(paths.db_path)
     initialize_database(conn)
+    enforce_roster_preflight(conn)
     runtime = get_worker_runtime(conn, args.runtime_id)
     if runtime["approval_required"] and runtime["approval_status"] != "approved":
         raise SystemExit("runtime requires human approval before start")
@@ -1803,6 +1862,7 @@ def cmd_dispatch_create(args: argparse.Namespace) -> None:
     paths = resolve_paths(args.root)
     conn = connect(paths.db_path)
     initialize_database(conn)
+    enforce_roster_preflight(conn)
     sender = get_agent(conn, args.from_agent)
     worker = get_worker_definition(conn, args.to_worker)
     if args.task_id is not None:
@@ -2454,6 +2514,16 @@ def build_parser() -> argparse.ArgumentParser:
     agent_list = agent_sub.add_parser("list")
     agent_list.add_argument("--json", action="store_true")
     agent_list.set_defaults(func=cmd_agent_list)
+
+    agent_preflight = agent_sub.add_parser("preflight")
+    agent_preflight.add_argument("--json", action="store_true")
+    agent_preflight.set_defaults(func=cmd_agent_preflight)
+
+    agent_retire = agent_sub.add_parser("retire")
+    agent_retire.add_argument("agent")
+    agent_retire.add_argument("--by", help="agent performing the retirement (for audit)")
+    agent_retire.add_argument("--force", action="store_true", help="retire even if agent owns active tasks")
+    agent_retire.set_defaults(func=cmd_agent_retire)
 
     session_parser = subparsers.add_parser("session")
     session_sub = session_parser.add_subparsers(dest="session_command", required=True)

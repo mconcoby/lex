@@ -5,7 +5,7 @@ import os
 import sqlite3
 from pathlib import Path
 
-from lex.db import fetch_one, log_event
+from lex.db import fetch_one, log_event, run_roster_preflight
 from lex.role_contracts import get_role_contract
 
 SESSION_STALE_MINUTES = 15
@@ -635,3 +635,80 @@ def capture_git_snapshot(cwd: str | None = None) -> dict:
         "git_staged_files_json": json.dumps([f for f in staged_out.splitlines() if f]),
         "git_changed_files_json": json.dumps(changed_files),
     }
+
+
+# Fatal issue kinds: presence of any of these blocks routing operations.
+PREFLIGHT_FATAL_KINDS = frozenset({"orphaned_task", "retired_leased"})
+
+
+def enforce_roster_preflight(
+    conn: sqlite3.Connection,
+    *,
+    exclude_reconnecting_agent_id: int | None = None,
+) -> None:
+    """Run the roster preflight and raise SystemExit if fatal drift is detected.
+
+    Fatal conditions (orphaned_task, retired_leased) block session start,
+    worker start, and dispatch until resolved. Duplicate-role issues are
+    non-fatal: they are surfaced but do not block.
+
+    Pass exclude_reconnecting_agent_id when starting a session for an agent
+    that owns orphaned tasks — starting their session resolves the orphan.
+    """
+    issues = run_roster_preflight(conn, exclude_reconnecting_agent_id=exclude_reconnecting_agent_id)
+    fatal = [i for i in issues if i["kind"] in PREFLIGHT_FATAL_KINDS]
+    warnings = [i for i in issues if i["kind"] not in PREFLIGHT_FATAL_KINDS]
+    for w in warnings:
+        print(f"roster warning [{w['kind']}] {w['agent_name']}: {w['detail']}")
+    if fatal:
+        lines = "\n".join(f"  [{i['kind']}] {i['agent_name']}: {i['detail']}" for i in fatal)
+        raise SystemExit(
+            f"roster preflight failed — resolve drift before proceeding:\n{lines}"
+        )
+
+
+def retire_agent(
+    conn: sqlite3.Connection,
+    *,
+    agent_id: int,
+    agent_name: str,
+    retiring_agent_id: int | None,
+) -> None:
+    """Mark an agent as retired, release its active leases, and emit an audit event.
+
+    Ownership of active tasks is NOT automatically transferred — callers must
+    reassign tasks before or after retiring the agent. The audit event captures
+    the full context for the event log.
+    """
+    # Release any active leases held by this agent
+    conn.execute(
+        """
+        UPDATE task_leases
+        SET state = 'released', released_at = CURRENT_TIMESTAMP
+        WHERE agent_id = ? AND state = 'active' AND released_at IS NULL
+        """,
+        (agent_id,),
+    )
+    # End any active sessions
+    conn.execute(
+        """
+        UPDATE sessions
+        SET status = 'ended', ended_at = CURRENT_TIMESTAMP, heartbeat_at = CURRENT_TIMESTAMP
+        WHERE agent_id = ? AND status = 'active' AND ended_at IS NULL
+        """,
+        (agent_id,),
+    )
+    # Mark the agent retired
+    conn.execute(
+        "UPDATE agents SET status = 'retired' WHERE id = ?",
+        (agent_id,),
+    )
+    log_event(
+        conn,
+        "agent.retired",
+        agent_id=agent_id,
+        payload={
+            "agent_name": agent_name,
+            "retired_by_agent_id": retiring_agent_id,
+        },
+    )

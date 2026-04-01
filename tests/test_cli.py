@@ -283,6 +283,32 @@ def test_merge_packet_and_apply_workflow(tmp_path):
     assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "# Proposed\n"
 
 
+def test_merge_plan_cli_command_creates_packet(tmp_path, capsys):
+    from lex.cli import main
+
+    (tmp_path / "AGENTS.md").write_text("# Existing\n", encoding="utf-8")
+    main(["--root", str(tmp_path), "merge", "plan", "--agent", "codex"])
+
+    out = capsys.readouterr().out
+    assert "created assisted merge packet" in out
+    assert (tmp_path / ".lex" / "runtime" / "install-merge-plan.md").exists()
+    assert (tmp_path / ".lex" / "runtime" / "install-merge-context" / "AGENTS.original.md").exists()
+
+
+def test_install_assisted_mode_preserves_files_and_creates_packet(tmp_path):
+    from lex.cli import main
+
+    (tmp_path / "AGENTS.md").write_text("# Existing\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.md").write_text("# Claude\n", encoding="utf-8")
+    main(["--root", str(tmp_path), "install", "--non-interactive", "--agent-files", "assisted",
+          "--ignore-policy", "runtime", "--ignore-target", "gitignore", "--assisted-agent", "claude"])
+
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == "# Existing\n"
+    assert (tmp_path / "CLAUDE.md").read_text(encoding="utf-8") == "# Claude\n"
+    assert (tmp_path / ".lex" / "runtime" / "install-merge-plan.md").exists()
+    assert (tmp_path / ".lex" / "runtime" / "install-merge-context" / "AGENTS.original.md").exists()
+
+
 def test_dashboard_state_loads_empty_workspace(tmp_path):
     paths = ensure_workspace(tmp_path)
     conn = connect(paths.db_path)

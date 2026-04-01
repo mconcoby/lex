@@ -22,11 +22,11 @@ ROLE_MIGRATIONS: dict[str, tuple[str, str]] = {
 CANONICAL_ROLES = {"dev", "pm", "auditor", "infra"}
 BUILTIN_SPECIALTIES = ("frontend", "infra", "ux", "security", "release")
 VALID_AGENT_KINDS = ("codex", "claude", "cursor", "gemini", "ci", "automated")
-# agents.status is intentionally restricted to 'active' only.
-# Lex does not soft-delete agents; stale agent records are reconciled by the PM
-# (removed or merged) rather than deactivated. If agent lifecycle states are
-# needed in the future, add 'inactive'/'retired' here and update the constraint.
-VALID_AGENT_STATUSES = ("active",)
+# agents.status values:
+#   active  — canonical, live agent; valid routing target
+#   retired — former agent; preserved for audit/history but must not receive
+#             new work. Roster preflight blocks routing to retired agents.
+VALID_AGENT_STATUSES = ("active", "retired")
 VALID_SESSION_STATUSES = ("active", "ended")
 VALID_WORKER_APPROVAL_POLICIES = ("always", "on_sensitive", "never")
 VALID_WORKER_RUNTIME_STATUSES = (
@@ -93,7 +93,7 @@ SCHEMA_STATEMENTS: tuple[str, ...] = (
         kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor', 'gemini', 'ci', 'automated')),
         role TEXT NOT NULL DEFAULT '',
         specialty TEXT NOT NULL DEFAULT '',
-        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
     """,
@@ -602,11 +602,20 @@ def migrate_database(conn: sqlite3.Connection) -> None:
 
 
 def migrate_agent_kinds(conn: sqlite3.Connection) -> None:
-    """Rebuild agents table if the kind CHECK constraint is missing ci or automated."""
+    """Rebuild agents table if the kind or status CHECK constraints are out of date."""
     schema = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='agents'"
     ).fetchone()
-    if schema is None or ("'ci'" in schema["sql"] and "'automated'" in schema["sql"]):
+    if schema is None:
+        return
+    sql = schema["sql"]
+    # Rebuild if any expected values are missing from CHECK constraints
+    needs_rebuild = (
+        "'ci'" not in sql
+        or "'automated'" not in sql
+        or "'retired'" not in sql
+    )
+    if not needs_rebuild:
         return
     conn.execute("PRAGMA foreign_keys = OFF;")
     conn.execute("""
@@ -616,7 +625,7 @@ def migrate_agent_kinds(conn: sqlite3.Connection) -> None:
             kind TEXT NOT NULL CHECK (kind IN ('codex', 'claude', 'cursor', 'gemini', 'ci', 'automated')),
             role TEXT NOT NULL DEFAULT '',
             specialty TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active')),
+            status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -672,6 +681,97 @@ def log_event(
             """,
             (event_id, event_id, task_id),
         )
+
+
+def run_roster_preflight(
+    conn: sqlite3.Connection,
+    *,
+    exclude_reconnecting_agent_id: int | None = None,
+) -> list[dict]:
+    """Scan the agent roster for drift issues that could cause mis-routing.
+
+    Returns a list of issue dicts, each with:
+      kind         — issue category (see below)
+      agent_id     — the agent involved
+      agent_name   — human-readable name
+      detail       — description of the problem
+
+    Issue kinds:
+      orphaned_task   — active task owned by an agent with no live session;
+                        the task may be stranded and routing is ambiguous.
+      retired_leased  — a retired agent still holds an active lease; the lock
+                        must be released before that agent can be safely removed.
+      duplicate_role  — two or more active agents share the same kind+role,
+                        making routing ambiguous for that role.
+    """
+    issues: list[dict] = []
+
+    # orphaned_task: active-status tasks whose owner has no active session.
+    # Exclude tasks owned by the reconnecting agent — their session start IS the resolution.
+    rows = conn.execute(
+        """
+        SELECT t.id AS task_id, t.title, a.id AS agent_id, a.name AS agent_name
+        FROM tasks t
+        JOIN agents a ON a.id = t.owner_agent_id
+        WHERE t.status IN ('claimed', 'in_progress', 'blocked', 'review_requested', 'handoff_pending')
+          AND a.id != COALESCE(?, -1)
+          AND NOT EXISTS (
+              SELECT 1 FROM sessions s
+              WHERE s.agent_id = a.id AND s.status = 'active' AND s.ended_at IS NULL
+          )
+        """,
+        (exclude_reconnecting_agent_id,),
+    ).fetchall()
+    for row in rows:
+        issues.append({
+            "kind": "orphaned_task",
+            "agent_id": row["agent_id"],
+            "agent_name": row["agent_name"],
+            "detail": f"task {row['task_id']} ({row['title']!r}) is active but owner has no live session",
+        })
+
+    # retired_leased: retired agents holding active leases
+    rows = conn.execute(
+        """
+        SELECT a.id AS agent_id, a.name AS agent_name, tl.task_id
+        FROM task_leases tl
+        JOIN agents a ON a.id = tl.agent_id
+        WHERE tl.state = 'active' AND tl.released_at IS NULL AND a.status = 'retired'
+        """
+    ).fetchall()
+    for row in rows:
+        issues.append({
+            "kind": "retired_leased",
+            "agent_id": row["agent_id"],
+            "agent_name": row["agent_name"],
+            "detail": f"retired agent still holds active lease on task {row['task_id']}",
+        })
+
+    # duplicate_role: multiple active agents with same non-empty kind+role
+    rows = conn.execute(
+        """
+        SELECT kind, role, COUNT(*) AS cnt
+        FROM agents
+        WHERE status = 'active' AND role != ''
+        GROUP BY kind, role
+        HAVING cnt > 1
+        """
+    ).fetchall()
+    for row in rows:
+        agents = conn.execute(
+            "SELECT id, name FROM agents WHERE status = 'active' AND kind = ? AND role = ?",
+            (row["kind"], row["role"]),
+        ).fetchall()
+        names = ", ".join(a["name"] for a in agents)
+        for agent in agents:
+            issues.append({
+                "kind": "duplicate_role",
+                "agent_id": agent["id"],
+                "agent_name": agent["name"],
+                "detail": f"multiple active {row['kind']}/{row['role']} agents: {names}",
+            })
+
+    return issues
 
 
 def derive_event_provenance(

@@ -8,20 +8,20 @@ from pathlib import Path
 @dataclass(frozen=True)
 class MergePaths:
     root: Path
-    rex_runtime: Path
+    lex_runtime: Path
     context_dir: Path
     proposal_dir: Path
     plan_path: Path
 
 
 def resolve_merge_paths(root: Path) -> MergePaths:
-    rex_runtime = root / ".lex" / "runtime"
+    lex_runtime = root / ".lex" / "runtime"
     return MergePaths(
         root=root,
-        rex_runtime=rex_runtime,
-        context_dir=rex_runtime / "install-merge-context",
-        proposal_dir=rex_runtime / "install-merge-proposal",
-        plan_path=rex_runtime / "install-merge-plan.md",
+        lex_runtime=lex_runtime,
+        context_dir=lex_runtime / "install-merge-context",
+        proposal_dir=lex_runtime / "install-merge-proposal",
+        plan_path=lex_runtime / "install-merge-plan.md",
     )
 
 

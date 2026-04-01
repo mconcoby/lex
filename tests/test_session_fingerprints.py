@@ -66,3 +66,33 @@ def test_dashboard_state_exposes_session_fingerprint(tmp_path):
     assert state.sessions[0]["fingerprint_label"] == "hostA:pts1:100"
     assert state.sessions[0]["agent_role"] == "dev"
     assert state.sessions[0]["agent_specialty"] == "engineer"
+
+
+def test_session_start_same_fingerprint_does_not_warn(tmp_path, capsys):
+    _, conn = init_workspace(tmp_path)
+    conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-brisk-otter', 'codex', 'dev', 'engineer', 'active')")
+    conn.commit()
+
+    main(
+        [
+            "--root", str(tmp_path),
+            "session", "start", "codex-brisk-otter",
+            "--label", "primary",
+            "--fingerprint", "fp-one",
+            "--fingerprint-label", "hostA:pts1:100",
+        ]
+    )
+    capsys.readouterr()
+
+    main(
+        [
+            "--root", str(tmp_path),
+            "session", "start", "codex-brisk-otter",
+            "--label", "resume",
+            "--fingerprint", "fp-one",
+            "--fingerprint-label", "hostA:pts1:100",
+        ]
+    )
+    second = capsys.readouterr().out
+
+    assert "warning: another active session exists for this agent" not in second

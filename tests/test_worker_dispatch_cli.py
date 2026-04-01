@@ -120,8 +120,8 @@ def test_dispatch_packet_lifecycle_writes_worker_inbox(tmp_path):
     register_pm_agent(conn)
     conn.execute(
         """
-        INSERT INTO tasks (title, description, status, priority, owner_agent_id, delegation_mode)
-        VALUES ('Dispatch task', '', 'claimed', 2, 1, 'direct')
+        INSERT INTO tasks (title, description, status, priority, delegation_mode)
+        VALUES ('Dispatch task', '', 'open', 2, 'direct')
         """
     )
     conn.commit()
