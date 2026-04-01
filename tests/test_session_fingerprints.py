@@ -96,3 +96,39 @@ def test_session_start_same_fingerprint_does_not_warn(tmp_path, capsys):
     second = capsys.readouterr().out
 
     assert "warning: another active session exists for this agent" not in second
+
+
+def test_bootstrap_show_displays_continuity_from_previous_session(tmp_path, capsys):
+    _, conn = init_workspace(tmp_path)
+    conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-brisk-otter', 'codex', 'dev', 'engineer', 'active')")
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, fingerprint, fingerprint_label, status, cwd, capabilities_json, ended_at)
+        VALUES (1, 'first', 'fp-one', 'hostA:pts1:100', 'ended', ?, '{}', CURRENT_TIMESTAMP)
+        """,
+        (str(tmp_path),),
+    )
+    first_session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, fingerprint, fingerprint_label, status, cwd, capabilities_json)
+        VALUES (1, 'second', 'fp-two', 'hostA:pts2:101', 'active', ?, '{}')
+        """,
+        (str(tmp_path),),
+    )
+    second_session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO session_bootstraps (
+            session_id, agent_id, continuity_from_session_id, role_contract_json, memory_json, system_prompt, workflow_template_json, required_actions_json
+        )
+        VALUES (?, 1, ?, '{"role":"dev"}', '{}', '', '[]', '[]')
+        """,
+        (second_session_id, first_session_id),
+    )
+    conn.commit()
+
+    main(["--root", str(tmp_path), "session", "bootstrap-show", str(second_session_id)])
+    out = capsys.readouterr().out
+
+    assert f"continuity from session: {first_session_id}" in out

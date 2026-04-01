@@ -37,6 +37,39 @@ def test_session_start_creates_bootstrap_with_hydrated_memory(tmp_path):
     assert memory["inbox"][0]["subject"] == "hello"
 
 
+def test_session_start_links_bootstrap_continuity_to_previous_session(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-dev-otter', 'codex', 'dev', '', 'active')")
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, cwd, capabilities_json)
+        VALUES (1, 'first', 'active', ?, '{}')
+        """,
+        (str(tmp_path),),
+    )
+    first_session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO session_bootstraps (
+            session_id, agent_id, role_contract_json, memory_json, system_prompt, workflow_template_json, required_actions_json,
+            acknowledged_at, acknowledged_by
+        )
+        VALUES (?, 1, '{}', '{}', '', '[]', '[]', CURRENT_TIMESTAMP, 'human')
+        """,
+        (first_session_id,),
+    )
+    conn.execute(
+        "UPDATE sessions SET status = 'ended', ended_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (first_session_id,),
+    )
+    conn.commit()
+
+    main(["--root", str(tmp_path), "session", "start", "codex-dev-otter", "--label", "second"])
+
+    bootstrap = conn.execute("SELECT * FROM session_bootstraps ORDER BY id DESC LIMIT 1").fetchone()
+    assert bootstrap["continuity_from_session_id"] == first_session_id
+
+
 def test_pm_claim_requires_override_after_bootstrap(tmp_path):
     _, conn = init_workspace(tmp_path)
     conn.execute("INSERT INTO agents (name, kind, role, specialty, status) VALUES ('codex-pm-dalton', 'codex', 'pm', '', 'active')")

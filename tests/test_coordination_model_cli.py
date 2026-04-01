@@ -74,6 +74,53 @@ def test_stale_session_lease_is_released_during_claim(tmp_path):
     assert new_lease["state"] == "active"
 
 
+def test_fresh_session_lease_is_not_released_during_claim(tmp_path):
+    _, conn = init_workspace(tmp_path)
+    register_agents(conn)
+    codex_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("codex-brisk-otter",)).fetchone()["id"]
+    claude_id = conn.execute("SELECT id FROM agents WHERE name = ?", ("claude-steady-ibis",)).fetchone()["id"]
+
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, cwd, capabilities_json)
+        VALUES (?, 'primary', 'active', ?, '{}')
+        """,
+        (claude_id, str(tmp_path)),
+    )
+    active_session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO sessions (agent_id, label, status, cwd, capabilities_json)
+        VALUES (?, 'secondary', 'active', ?, '{}')
+        """,
+        (codex_id, str(tmp_path)),
+    )
+    conn.execute(
+        "INSERT INTO tasks (title, status, owner_agent_id) VALUES ('Protected task', 'in_progress', ?)",
+        (claude_id,),
+    )
+    task_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO task_leases (task_id, agent_id, session_id, expires_at)
+        VALUES (?, ?, ?, datetime('now', '+30 minutes'))
+        """,
+        (task_id, claude_id, active_session_id),
+    )
+    conn.commit()
+
+    with pytest.raises(SystemExit, match=f"task {task_id} is already leased by another agent"):
+        main(["--root", str(tmp_path), "task", "claim", str(task_id), "codex-brisk-otter"])
+
+    lease = conn.execute(
+        "SELECT state, released_at, session_id FROM task_leases WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert lease["state"] == "active"
+    assert lease["released_at"] is None
+    assert lease["session_id"] == active_session_id
+
+
 def test_session_end_releases_bound_leases(tmp_path):
     _, conn = init_workspace(tmp_path)
     register_agents(conn)
