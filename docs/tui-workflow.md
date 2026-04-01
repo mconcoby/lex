@@ -40,8 +40,8 @@ Execution note:
 
 - `a`: register an agent
 - `s`: start a session
-- `h`: send a heartbeat for the selected session
-- `x`: end the selected session
+- `h`: send a heartbeat for the selected session (selected in the session pane)
+- `x`: end the selected session (selected in the session pane)
 
 ## Visual Warnings
 

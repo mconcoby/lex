@@ -361,3 +361,7 @@ Run the test suite with:
 ```bash
 python3 -m pytest
 ```
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
