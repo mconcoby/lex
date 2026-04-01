@@ -7,8 +7,12 @@ This project was independently implemented and was inspired at a high level by [
 The v1 implementation in this repository provides:
 
 - A durable `.lex/` scaffold for project memory
-- A SQLite-backed coordination store for agents, tasks, leases, and messages
+- A SQLite-backed coordination store for agents, tasks, leases, messages, sessions, and events
 - A Python CLI for bootstrapping, live agent presence, and concurrent task coordination
+- Path conflict detection with branch-aware lease enforcement
+- Git-aware session state with per-session snapshots and dirty-file tracking
+- Action provenance tracking across automated, delegated, interactive, and loose operations
+- Roster reconciliation preflight that gates session start, worker launch, and dispatch on clean agent state
 - An experimental dispatch control plane for supervised local worker runtimes and task packets
 
 ## Quick start
@@ -48,10 +52,13 @@ python3 -m lex.cli agent identify codex
 ```
 
 That registers a unique name like `codex-brisk-otter`. If you want to choose a name yourself, pass `--name`, and Lex will reject duplicates.
+
 Agents now use a two-part org model:
 - canonical primary role: `dev`, `pm`, `auditor`, or `infra`
 - built-in specialties: `frontend`, `infra`, `ux`, `security`, `release`
 - user-defined specialties can be added per workspace
+
+Supported agent kinds: `codex`, `claude`, `cursor`, `gemini`, `ci`, `automated`
 
 The subcommands still exist for scripting and direct control:
 
@@ -165,12 +172,61 @@ python3 -m lex.cli task show 2
 python3 -m lex.cli session end 1
 ```
 
+Session start captures a git snapshot automatically: current branch, base ref, dirty files, and staged changes are stored on the session row and refreshed on each heartbeat. This gives the coordination layer visibility into each agent's working tree without requiring agents to report it manually.
+
 Role guards apply to task verbs. For example, a `pm` session is expected to review inbox, inspect child work, and delegate before acting freely, and `task claim` is blocked unless you explicitly override the role contract:
 
 ```bash
 python3 -m lex.cli task claim 7 codex-pm-dalton
 python3 -m lex.cli task claim 7 codex-pm-dalton --force-role-override
 ```
+
+## Path Conflict Detection
+
+When an agent claims a task, Lex checks whether any active leases already cover an overlapping set of paths. Component-wise prefix matching is used so `src/foo` and `src/foobar` are treated as siblings rather than conflicts.
+
+```bash
+python3 -m lex.cli task claim 3 codex-brisk-otter           # warns on overlap
+python3 -m lex.cli task claim 3 codex-brisk-otter --strict  # blocks on same-branch overlap
+```
+
+Cross-branch conflicts (where the competing lease belongs to a session on a different git branch) are always downgraded to warnings, even under `--strict`, since those changes are not in the same working tree. Each detected conflict emits a `task.conflict_detected` event with the owner agent, branch, and overlapping paths for audit purposes.
+
+## Action Provenance
+
+Every event in the audit log carries a derived provenance category visible in `event list`:
+
+- **automated** — emitted by a `ci` or `automated` agent kind
+- **delegated** — emitted inside a session that is executing a child task (has a `parent_task_id`)
+- **interactive** — emitted inside any other active session
+- **loose** — emitted outside a session (e.g. direct CLI calls with no `session start`)
+
+The `Src` column in `event list` output is colour-coded by provenance category. No extra flags are needed; provenance is derived at query time from the stored `agent_kind`, `session_id`, and `parent_task_id` on each event row.
+
+## Roster Reconciliation Preflight
+
+Lex validates agent roster health before allowing session start, worker launch, or dispatch create. The preflight detects three classes of drift:
+
+| Kind | Severity | Description |
+|------|----------|-------------|
+| `orphaned_task` | fatal | A claimed task whose owner has no active session |
+| `retired_leased` | fatal | A retired agent that still holds an active lease |
+| `duplicate_role` | warning | Multiple active agents sharing the same canonical role |
+
+Fatal issues block the gated operation with a clear error message. Warnings are printed but do not block.
+
+```bash
+# Check roster health without starting a session
+python3 -m lex.cli agent preflight
+
+# Retire an agent cleanly — releases leases, ends sessions, emits audit event
+python3 -m lex.cli agent retire codex-brisk-otter
+
+# Retire even if the agent still owns active tasks (use with care)
+python3 -m lex.cli agent retire codex-brisk-otter --force
+```
+
+When an agent reconnects (starting a new session after a crash), the preflight automatically excludes orphaned tasks owned by that same agent so legitimate restarts are not blocked.
 
 ## Watches
 
@@ -227,6 +283,8 @@ python3 -m lex.cli dispatch ack 1 --runtime-id 1 --note "accepted"
 python3 -m lex.cli dispatch complete 1 completed --note "merged into feature branch"
 ```
 
+Stale worker runtimes (heartbeat older than the configured threshold) are automatically failed by `worker cleanup`, and any in-flight dispatch packets delivered to those runtimes are failed with a `stale heartbeat` completion note.
+
 ## Agent Roles
 
 Roles are split into a canonical primary role plus optional specialty so Lex can mirror software-organization responsibilities without copying a human org chart too literally.
@@ -256,3 +314,20 @@ Recommended mapping:
 - `pm`: planning, design, scoping, release coordination
 - `auditor`: review, verification, compliance, regression checking
 - `infra`: integration, merge coordination, release plumbing
+
+Role contracts per role:
+
+| Role | Blocked verbs | Required first actions |
+|------|--------------|------------------------|
+| `pm` | `task_claim` | review_inbox, inspect_open_child_tasks, assign_or_delegate_work |
+| `dev` | _(none)_ | review_inbox, inspect_assigned_tasks, report_execution_plan |
+| `auditor` | `task_claim` | review_inbox, inspect_review_queue, record_review_plan |
+| `infra` | _(none)_ | review_inbox, inspect_integration_queue, record_integration_plan |
+
+## Testing
+
+```bash
+pytest tests/
+```
+
+108 tests across 11 files covering CLI commands, coordination model invariants, git awareness, path conflict detection, action provenance, role contract enforcement, dispatch lifecycle, session fingerprints, and roster preflight validation.
